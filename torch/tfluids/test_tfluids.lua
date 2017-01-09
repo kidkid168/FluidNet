@@ -21,55 +21,21 @@
 -- qlua -ltfluids -e "tfluids.test()"
 
 local cutorch = require('cutorch')
+local nn = require('nn')
+
+dofile('../lib/load_manta_file.lua')  -- For torch.loadMantaFile()
 
 torch.setdefaulttensortype('torch.DoubleTensor')
 torch.setnumthreads(8)
 
 -- Create an instance of the test framework
-local precision = 1e-5
-local loosePrecision = 2e-4
+local precision = 1e-6
+local loosePrecision = 1e-4
 local mytester = torch.Tester()
 local test = torch.TestSuite()
 local times = {}
 local profileTimeSec = 1
-
-function test.MoveImpulseWithinImage2D()
-  local methods = {'euler', 'rk2'}
-  for _, method in pairs(methods) do
-    local d = 1
-    local w = torch.random(5, 10)
-    local h = torch.random(5, 10)
-    local s = torch.zeros(d, h, w)
-    -- Create an impulse.
-    local u = torch.random(2, w - 1)
-    local v = torch.random(2, h - 1)
-    s[{1, v, u}] = 1
-    -- Move the impulse to another location in the image by advecting it.
-    local dx = torch.random(-u + 1, w - u)
-    local dy = torch.random(-v + 1, h - v)
-    -- Add a tiny offset so it is not EXACTLY in the center.
-    local vel = torch.zeros(2, d, h, w)
-    vel[1]:fill(dx + torch.rand(1)[1] * 2e-5 - 1e-5)
-    vel[2]:fill(dy + torch.rand(1)[1] * 2e-5 - 1e-5)
-    local dt = 1
-    local geom = torch.zeros(d, h, w)
-    local sM = s:clone():fill(0)
-    tfluids.advectScalar(dt, s, vel, geom, sM, method)
-    local uM = u + dx
-    local vM = v + dy
-    -- Make sure we did keep the ground truth location on the image.
-    assert(vM >= 1 and vM <= h and uM >= 1 and uM <= w, 'Test logic error')
-    mytester:eq(sM[{1, vM, uM}], 1, 1e-4, 'Bad (1) position!')
-    sM[{1, vM, uM}] = 0
-    -- Now the whole thing should be zeros.
-    mytester:asserteq(sM:min(), 0, 'Bad position!')
-    mytester:assertlt(sM:max(), 1e-4, 'Bad position!') 
-  end
-end
-
-function test.ScalarAdvectionLinear()
-  -- TODO(tompson): Finish this.
-end
+local jac = nn.Jacobian
 
 local function profileCuda(func, name, args)
   local tm = {}
@@ -103,38 +69,58 @@ local function profileCuda(func, name, args)
   tm.gpu = a:time().real / count
 end
 
-function test.averageBorderCellsCUDA()
-  -- TODO(tompson): Write a test of the forward function.
+function test.advectScalar()
+  for dim = 2, 3 do
+    -- Load the pre-advection Manta file for this test.
+    local fn = 'test_data/' .. dim .. 'd_initial.bin'
+    local _, U, flags, density, is3D = torch.loadMantaFile(fn)
+    assert(is3D == (dim == 3))
 
-  -- Test that the float and cuda implementations are the same.
-  local nchan = {2, 3}
-  local d = {1, torch.random(32, 64)}
-  local w = torch.random(32, 64)
-  local h = torch.random(32, 64)
-  local case = {'2D', '3D'}
+    -- Now do advection using the 2 parameters and check against Manta.
+    for order = 1, 1 do  -- TEMP CODE.
+      for _, openBounds in pairs({false, true}) do
+        -- Load the Manta ground truth.
+        local openStr
+        if openBounds then
+          openStr = 'True'
+        else
+          openStr = 'False'
+        end
+        fn = ('test_data/' .. dim .. 'd_advect_openBounds_' .. openStr ..
+              '_order_' .. order ..'.bin')
+        local _, UDiv, flagsDiv, densityManta, is3D = torch.loadMantaFile(fn)
+        assert(is3D == (dim == 3))
 
-  for testId = 1, 2 do
-    -- 2D and 3D cases.
-    local geom = torch.rand(d[testId], h, w):gt(0.8):float()
-    local input = torch.rand(nchan[testId], d[testId], h, w):float()
-    local outputCPU = input:clone()
+        -- Make sure that Manta didn't change the flags.
+        assert((flags - flagsDiv):abs():max() == 0, 'Flags changed!')
 
-    -- Perform the function on the CPU.
-    tfluids.averageBorderCells(input, geom, outputCPU)
+        -- Perform our own advection.
+        local dt = 0.1  -- Unfortunately hard coded for now.
+        local boundaryWidth = 0  -- Also shouldn't be hard coded.
+        local method
+        if order == 1 then
+          method = 'euler'
+        else
+          method = 'maccormack'
+        end
+        -- Note: the clone's here are to make sure every inner loops
+        -- sees completely independent data.
+        local densityAdv =
+            torch.rand(unpack(density:size():totable())):typeAs(density)
+        tfluids.advectScalar(dt, density:clone(), U:clone(), flags:clone(),
+                             densityAdv, method, openBounds, boundaryWidth)
+        local err = densityManta - densityAdv
 
-    -- Perform the function on the GPU.
-    local outputGPU = input:cuda()
-    tfluids.averageBorderCells(input:cuda(), geom:cuda(), outputGPU)
-
-    -- Compare the results.
-    local maxErr = (outputCPU - outputGPU:float()):abs():max()
-    mytester:assertlt(maxErr, precision,
-                      'averageBorderCells CUDA ERROR ' .. case[testId])
-
-    profileCuda(tfluids.averageBorderCells,
-                'averageBorderCells' .. case[testId], {input, geom, outputCPU})
+        mytester:assertlt(err:abs():max(), precision,
+                          ('Error: tfluids.advectScalar dim ' .. dim ..
+                           ', order ' .. order .. ', openBounds ' ..
+                           tostring(openBounds)))
+      end
+    end
   end
 end
+
+--[[
 
 function test.vorticityConfinementCUDA()
   -- TODO(tompson): Write a test of the forward function.
@@ -205,14 +191,13 @@ function test.calcVelocityUpdateCUDA()
 
   -- Test that the float and cuda implementations are the same.
   local batchSize = torch.random(1, 3)
-  local nchan = {2, 3, 2, 3}
-  local d = {1, torch.random(32, 64), 1, torch.random(32, 64)}
+  local nchan = {2, 3}
+  local d = {1, torch.random(32, 64), 1}
   local w = torch.random(32, 64)
   local h = torch.random(32, 64)
-  local case = {'2D', '3D', '2DMatchManta', '3DMatchManta'}
-  local matchManta = {false, false, true, true}
+  local case = {'2D', '3D'}
 
-  for testId = 1, 4 do
+  for testId = 1, #nchan do
     -- 2D and 3D cases.
     local geom = torch.rand(batchSize, d[testId], h, w):gt(0.8):float()
     local p = torch.rand(batchSize, d[testId], h, w):float()
@@ -220,12 +205,11 @@ function test.calcVelocityUpdateCUDA()
         torch.rand(batchSize, nchan[testId], d[testId], h, w):float()
 
     -- Perform the function on the CPU.
-    tfluids.calcVelocityUpdate(outputCPU, p, geom, matchManta[testId])
+    tfluids.calcVelocityUpdate(outputCPU, p, geom)
 
     -- Perform the function on the GPU.
     local outputGPU = outputCPU:clone():fill(math.huge):cuda()
-    tfluids.calcVelocityUpdate(outputGPU, p:cuda(), geom:cuda(),
-                               matchManta[testId])
+    tfluids.calcVelocityUpdate(outputGPU, p:cuda(), geom:cuda())
 
     -- Compare the results.
     local maxErr = (outputCPU - outputGPU:float()):abs():max()
@@ -237,12 +221,11 @@ function test.calcVelocityUpdateCUDA()
       torch.rand(batchSize, nchan[testId], d[testId], h, w):float()
 
     local gradPCPU = p:clone():fill(math.huge)
-    tfluids.calcVelocityUpdateBackward(gradPCPU, p, geom, gradOutput,
-                                       matchManta[testId])
+    tfluids.calcVelocityUpdateBackward(gradPCPU, p, geom, gradOutput)
 
     local gradPGPU = p:clone():fill(math.huge):cuda()
     tfluids.calcVelocityUpdateBackward(gradPGPU, p:cuda(), geom:cuda(),
-                                       gradOutput:cuda(), matchManta[testId])
+                                       gradOutput:cuda())
 
     maxErr = (gradPCPU - gradPGPU:float()):abs():max()
     mytester:assertlt(maxErr, precision,
@@ -250,66 +233,68 @@ function test.calcVelocityUpdateCUDA()
 
     profileCuda(tfluids.calcVelocityUpdate,
                 'calcVelocityUpdate' .. case[testId],
-                {outputCPU, p, geom, matchManta[testId]})
+                {outputCPU, p, geom})
 
     profileCuda(tfluids.calcVelocityUpdateBackward,
                 'calcVelocityUpdateBackward' .. case[testId],
-                {gradPCPU, p, geom, gradOutput, matchManta[testId]})
+                {gradPCPU, p, geom, gradOutput})
   end
 end
 
+--]]
+
+--[[
 function test.advectScalarCUDA()
   -- Test that the float and cuda implementations are the same.
-  for sampleIntoGeom = 0, 1 do
-    for dim = 2, 3 do
-      local dt = torch.uniform(0.5, 1)
-      local d
-      if dim == 2 then
-        d = 1
-      else
-        d = torch.random(32, 64)
-      end
-      local h = torch.random(32, 64)
-      local w = torch.random(32, 64)
-      local methods = {'euler', 'rk2'}
- 
-      local p = torch.rand(d, h, w):float()
-      -- Mul rand by 10 to get reasonable coverage over multiple cells.
-      local u = torch.rand(dim, d, h, w):mul(5):float()
-      local geom = torch.rand(d, h, w):gt(0.8):float()
+  for dim = 2, 3 do
+    local dt = torch.uniform(0.5, 1)
+    local d
+    if dim == 2 then
+      d = 1
+    else
+      d = torch.random(32, 64)
+    end
+    local h = torch.random(32, 64)
+    local w = torch.random(32, 64)
+    local methods = {'euler', 'maccormack'}
 
-      p:cmul(1 - geom)  -- Zero out geometry cells.
-  
-      for _, method in pairs(methods) do
-        local caseStr = ('advectScalar - method: ' .. method .. ', dim: ' ..
-                         dim .. ', sampleIntoGeom: ' .. sampleIntoGeom)
-  
-        -- Perform advection on the CPU.
-        local pDst = p:clone():fill(0)
-        tfluids.advectScalar(dt, p, u, geom, pDst, method,
-                             sampleIntoGeom == 1)
-  
-        -- Perform advection on the GPU.
-        local pDstGPU = p:clone():fill(0):cuda()
-        tfluids.advectScalar(dt, p:cuda(), u:cuda(), geom:cuda(), pDstGPU,
-                             method, sampleIntoGeom == 1)
-        
-        local maxErr = (pDst - pDstGPU:float()):abs():max()
-        -- TODO(tompson): It's troubling that we need loose precision here.
-        -- Maybe it's OK, but it is never-the-less surprising.
+    local p = torch.rand(d, h, w):float()
+    -- Mul rand by 10 to get reasonable coverage over multiple cells.
+    local u = torch.rand(dim, d, h, w):mul(5):float()
+    local geom = torch.rand(d, h, w):gt(0.8):float()
 
-        -- NOTE: This might actually fail sometimes (rarely, but I've seen
-        -- it happen). This is because floating point roundoff can cause rays
-        -- to brush past geometry cells but not actually trigger intersections. 
-        mytester:assertlt(maxErr, loosePrecision, 'ERROR: ' .. caseStr)
+    p:cmul(1 - geom)  -- Zero out geometry cells.
 
-        profileCuda(tfluids.advectScalar, caseStr,
-                    {dt, p, u, geom, pDst, method, sampleIntoGeom == 1})
-      end
+    for _, method in pairs(methods) do
+      local caseStr = ('advectScalar - method: ' .. method .. ', dim: ' ..
+                       dim)
+
+      -- Perform advection on the CPU.
+      local pDst = p:clone():fill(0)
+      tfluids.advectScalar(dt, p, u, geom, pDst, method)
+
+      -- Perform advection on the GPU.
+      local pDstGPU = p:clone():fill(0):cuda()
+      tfluids.advectScalar(dt, p:cuda(), u:cuda(), geom:cuda(), pDstGPU,
+                           method)
+      
+      local maxErr = (pDst - pDstGPU:float()):abs():max()
+      -- TODO(tompson): It's troubling that we need loose precision here.
+      -- Maybe it's OK, but it is never-the-less surprising.
+
+      -- NOTE: This might actually fail sometimes (rarely, but I've seen
+      -- it happen). This is because floating point roundoff can cause rays
+      -- to brush past geometry cells but not actually trigger intersections. 
+      mytester:assertlt(maxErr, loosePrecision, 'ERROR: ' .. caseStr)
+
+      profileCuda(tfluids.advectScalar, caseStr,
+                  {dt, p, u, geom, pDst, method})
     end
   end
 end
+--]]
 
+--[[
 function test.advectVelCUDA()
   -- Test that the float and cuda implementations are the same.
   for dim = 2, 3 do
@@ -322,7 +307,7 @@ function test.advectVelCUDA()
     end
     local h = torch.random(32, 64)
     local w = torch.random(32, 64)
-    local methods = {'euler', 'rk2'}  
+    local methods = {'euler', 'maccormack'}  
 
     -- Mul rand by 10 to get reasonable coverage over multiple cells.
     local u = torch.rand(dim, d, h, w):mul(5):float()
@@ -352,6 +337,7 @@ function test.advectVelCUDA()
     end
   end
 end
+--]]
 
 --[[
 function test.solveLinearSystemPCGCUDA()
@@ -381,6 +367,8 @@ function test.solveLinearSystemPCGCUDA()
   end
 end
 --]]
+
+--[[
 
 function test.calcVelocityDivergenceCUDA()
   -- NOTE: The forward and backward function tests are in:
@@ -484,115 +472,67 @@ function test.interpField()
   -- TODO(tompson,kris): Is this enough test cases?
 end
 
-function test.setObstacleBcs()
-  local nchan = {2, 3}
-  local d = {1, torch.random(32, 64)}
-  local w = torch.random(32, 64)
-  local h = torch.random(32, 64)
+--]]
 
-  for testId = 1, 2 do
-    local twoDim = nchan[testId] == 2
-    local geom = torch.zeros(d[testId], h, w)
-    local U = torch.rand(nchan[testId], d[testId], h, w)
+function test.VolumetricUpSamplingNearest()
+  local batchSize = torch.random(1, 5)
+  local nPlane = torch.random(1, 5)
+  local widthIn = torch.random(5, 8)
+  local heightIn = torch.random(5, 8)
+  local depthIn = torch.random(5, 8)
+  local ratio = torch.random(1, 3)
 
-    -- Make a contiguous chunk of geometry.
-    local istart = 16
-    local iend = 20
-    local i0 = (istart - 1) - 0.5 - 1e-6  -- The geom face in 0-index coords.
-    local i1 = (iend - 1) + 0.5 + 1e-6  -- The geom face in 0-index coords.
-    local ic = (iend + istart) * 0.5 - 1  -- Center in 0-index coords.
-    if not twoDim then
-      geom[{{16, 20}, {16, 20}, {16, 20}}]:fill(1)
-    else
-      geom[{1, {16, 20}, {16, 20}}]:fill(1)
+  local module = tfluids.VolumetricUpSamplingNearest(ratio)
+
+  local input = torch.rand(batchSize, nPlane, depthIn, heightIn, widthIn)
+  local output = module:forward(input):clone()
+
+  assert(output:dim() == 5)
+  assert(output:size(1) == batchSize)
+  assert(output:size(2) == nPlane)
+  assert(output:size(3) == depthIn * ratio)
+  assert(output:size(4) == heightIn * ratio)
+  assert(output:size(5) == widthIn * ratio)
+
+  local outputGT = torch.Tensor():resizeAs(output)
+  for b = 1, batchSize do
+    for f = 1, nPlane do
+      for z = 1, depthIn * ratio do
+        local zIn = math.floor((z - 1) / ratio) + 1
+        for y = 1, heightIn * ratio do
+          local yIn = math.floor((y - 1) / ratio) + 1
+          for x = 1, widthIn * ratio do
+            local xIn = math.floor((x - 1) / ratio) + 1
+            outputGT[{b, f, z, y, x}] = input[{b, f, zIn, yIn, xIn}]
+          end
+        end
+      end
     end
-
-    -- Set the internal U values.
-    tfluids.setObstacleBcs(U, geom)
-
-    -- Now interpolate a value at one of the geometry faces and make sure
-    -- the velocity component is zero.
-    -- Left face.
-    local pos = torch.Tensor({i0, ic, ic})  -- Recall: 0-indexed.
-    if twoDim then
-      pos[3] = 0
-    end
-    local Ux = tfluids.interpField(U[1], geom, pos)
-    mytester:assertlt(math.abs(Ux), 1e-5, 'Bad face velocity value ' .. testId)
-
-    -- Right face.
-    pos = torch.Tensor({i1, ic, ic})  -- Recall: 0-indexed.
-    if twoDim then
-      pos[3] = 0
-    end
-    Ux = tfluids.interpField(U[1], geom, pos)
-    mytester:assertlt(math.abs(Ux), 1e-5, 'Bad face velocity value ' .. testId)
-
-    -- Bottom face.
-    pos = torch.Tensor({ic, i0, ic})  -- Recall: 0-indexed.
-    if twoDim then
-      pos[3] = 0
-    end
-    local Uy = tfluids.interpField(U[2], geom, pos)
-    mytester:assertlt(math.abs(Uy), 1e-5, 'Bad face velocity value ' .. testId)
-
-    -- Top face.
-    pos = torch.Tensor({ic, i1, ic})  -- Recall: 0-indexed.
-    if twoDim then
-      pos[3] = 0
-    end
-    Uy = tfluids.interpField(U[2], geom, pos)
-    mytester:assertlt(math.abs(Uy), 1e-5, 'Bad face velocity value ' .. testId)
-
-    if not twoDim then
-      -- Bottom face.
-      pos = torch.Tensor({ic, ic, i0})  -- Recall: 0-indexed.
-      local Uz = tfluids.interpField(U[3], geom, pos)
-      mytester:assertlt(math.abs(Uz), 1e-5,
-                        'Bad face velocity value ' .. testId)
-
-      -- Bottom face.
-      pos = torch.Tensor({ic, ic, i1})  -- Recall: 0-indexed.
-      Uz = tfluids.interpField(U[3], geom, pos)
-      mytester:assertlt(math.abs(Uz), 1e-5,
-                        'Bad face velocity value ' .. testId)
-    end
-
-    -- TODO(tompson): Is this enough test cases?
   end
-end
 
-function test.setObstacleBcsCUDA()
-  -- TODO(tompson): Write a test of the forward function.
+  -- Note FPROP should be exact (it's just a copy).
+  mytester:asserteq((output - outputGT):abs():max(), 0, 'error on fprop')
 
-  -- Test that the float and cuda implementations are the same.
-  local nchan = {2, 3}
-  local d = {1, torch.random(32, 64)}
-  local w = torch.random(32, 64)
-  local h = torch.random(32, 64)
-  local case = {'2D', '3D'}
+  -- Generate a valid gradInput (we'll use it to test the GPU implementation).
+  local gradOutput = torch.rand(batchSize, nPlane, depthIn * ratio,
+                                heightIn * ratio, widthIn * ratio);
+  local gradInput = module:backward(input, gradOutput):clone()
 
-  for testId = 1, 2 do
-    -- 2D and 3D cases.
-    local geom = torch.rand(d[testId], h, w):gt(0.8):float()
-    local U = torch.rand(nchan[testId], d[testId], h, w):float()
-    local UCPU = U:clone()
+  -- Perform the function on the GPU.
+  module:cuda()
+  local outputGPU = module:forward(input:cuda()):double()
+  mytester:assertle((output - outputGPU):abs():max(), precision,
+                    'error on GPU fprop')
 
-    -- Perform the function on the CPU.
-    tfluids.setObstacleBcs(UCPU, geom)
+  local gradInputGPU =
+      module:backward(input:cuda(), gradOutput:cuda()):double()
+  mytester:assertlt((gradInput - gradInputGPU):abs():max(), precision,
+                    'error on GPU bprop')
 
-    -- Perform the function on the GPU.
-    local UGPU = U:cuda()
-    tfluids.setObstacleBcs(UGPU, geom:cuda())
-
-    -- Compare the results.
-    local maxErr = (UCPU - UGPU:float()):abs():max()
-    mytester:assertlt(maxErr, precision,
-                      'setObstacleBcs CUDA ERROR ' .. case[testId])
-    
-    profileCuda(tfluids.setObstacleBcs, 'setObstacleBcs2D' .. case[testId],
-                {U, geom})
-  end
+  -- Check BPROP is correct.
+  module:double()
+  local err = jac.testJacobian(module, input)
+  mytester:assertlt(err, precision, 'error on bprop')
 end
 
 -- Now run the test above
@@ -614,20 +554,27 @@ function tfluids.test(tests, seed, gpuDevice)
   cutorch.manualSeed(seed)
   mytester:run(tests)
 
-  print ''
-  print('-----------------------------------------------------------------' ..
-        '-------------')
-  print('| Module                                                       ' ..
-        '| Speedup     |')
-  print('-----------------------------------------------------------------' ..
-        '-------------')
-  for module, tm in pairs(times) do
-    local str = string.format('| %-60s | %6.2f      |', module,
-                              (tm.cpu / tm.gpu))
-    print(str)
+  numTimes = 0
+  for _, _ in pairs(times) do
+    numTimes = numTimes + 1
   end
-  print('-----------------------------------------------------------------' ..
-        '-------------')
+
+  if numTimes > 0 then
+    print ''
+    print('-----------------------------------------------------------------' ..
+          '-------------')
+    print('| Module                                                       ' ..
+          '| Speedup     |')
+    print('-----------------------------------------------------------------' ..
+          '-------------')
+    for module, tm in pairs(times) do
+      local str = string.format('| %-60s | %6.2f      |', module,
+                                (tm.cpu / tm.gpu))
+      print(str)
+    end
+    print('-----------------------------------------------------------------' ..
+          '-------------')
+  end
 
   cutorch.setDevice(curDevice)
 

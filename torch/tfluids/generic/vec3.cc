@@ -18,11 +18,65 @@
 #include <cmath>
 #include <limits>
 
-typedef struct tfluids_(vec3) {
+struct tfluids_(vec3) {
   real x;
   real y;
   real z;
-} tfluids_(MyArrayType);
+
+  tfluids_(vec3)() : x(0), y(0), z(0) { }
+  tfluids_(vec3)(real _x, real _y, real _z) : x(_x), y(_y), z(_z) { }
+
+  tfluids_(vec3)& operator=(const tfluids_(vec3)& other) {  // Copy assignment.
+    if (this != &other) {
+      this->x = other.x;
+      this->y = other.y;
+      this->z = other.z;
+    }
+    return *this;
+  }
+
+  tfluids_(vec3)& operator+=(const tfluids_(vec3)& rhs) {  // accum vec
+    this->x += rhs.x;
+    this->y += rhs.y;
+    this->z += rhs.z;
+    return *this;
+  }
+ 
+  const tfluids_(vec3) operator+(const tfluids_(vec3)& rhs) const {  // add vec
+    tfluids_(vec3) ret = *this;
+    ret += rhs;
+    return ret;
+  }
+
+  tfluids_(vec3)& operator-=(const tfluids_(vec3)& rhs) {  // neg accum vec
+    this->x -= rhs.x;
+    this->y -= rhs.y;
+    this->z -= rhs.z;
+    return *this; 
+  }
+  
+  const tfluids_(vec3) operator-(const tfluids_(vec3)& rhs) const {  // sub vec
+    tfluids_(vec3) ret = *this;
+    ret -= rhs; 
+    return ret;
+  }
+
+  const tfluids_(vec3) operator+(const real rhs) const {  // add scalar
+    tfluids_(vec3) ret = *this;
+    ret.x += rhs;
+    ret.y += rhs;
+    ret.z += rhs;
+    return ret;
+  }
+  
+  const tfluids_(vec3) operator*(const real rhs) const {  // mult scalar
+    tfluids_(vec3) ret = *this;
+    ret.x *= rhs;
+    ret.y *= rhs;
+    ret.z *= rhs;
+    return ret;
+  }
+};
 
 static real tfluids_(length3)(const tfluids_(vec3)& v) {
   const real length_sq = v.x * v.x + v.y * v.y + v.z * v.z;

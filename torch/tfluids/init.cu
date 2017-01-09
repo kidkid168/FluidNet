@@ -19,6 +19,7 @@
 #include <TH.h>
 #include <luaT.h>
 #include "generic/tfluids.cu.h"
+#include "generic/stack_trace.cc"
 
 // This type is common to both float and double implementations and so has
 // to be defined outside tfluids.cc.

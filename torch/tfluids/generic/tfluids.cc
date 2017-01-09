@@ -20,7 +20,7 @@
 #include <memory>
 
 #include "generic/vec3.cc"
-#include "generic/calc_line_trace.cc"
+#include "generic/grid.cc"
 
 #ifdef BUILD_GL_FUNCS
   #if defined (__APPLE__) || defined (OSX)
@@ -40,916 +40,157 @@
   #endif
 #endif
 
-static inline real Mix(const real a, const real b, const real t) {
-  return (static_cast<real>(1.0) - t) * a + t * b;
-}
-
-static inline void MixWithGeom(
-    const real a, const real b, const bool a_geom, const bool b_geom,
-    const bool sample_into_geom, const real t, real* interp_val,
-    bool* interp_geom) {
-  if (sample_into_geom || (!a_geom && !b_geom)) {
-    *interp_geom = false;
-    *interp_val = (static_cast<real>(1.0) - t) * a + t * b;
-  } else if (a_geom && !b_geom) {
-    *interp_geom = false;
-    *interp_val = b;  // a is geometry, return b.
-  } else if (b_geom && !a_geom) {
-    *interp_geom = false;
-    *interp_val = a;  // b is geometry, return a.
-  } else {
-    *interp_geom = true;  // both a and b are geom.
-    *interp_val = static_cast<real>(0);
-  }
-}
-
-static inline real ClampReal(const real x, const real low, const real high) {
-  return std::max<real>(std::min<real>(x, high), low);
-}
-
-static inline real GetData(const real* x, int32_t i, int32_t j, int32_t k,
-                           const Int3& dim) {
-  if (tfluids_(IsOutOfDomain)(i, j, k, dim)) {
-    printf("ERROR: GetData index is out of domain\n");
-    exit(-1);
-  }
-  return x[IX(i, j, k, dim)];
-}
-
-// NOTE: As per our CalcLineTrace method we define the integer position values
-// as THE CENTER of the grid cells. That means that a value of (0, 0, 0) is the
-// center of the first grid cell, so the (-0.5, 0, 0) position is the LEFT
-// face of the first cell. Likewise (xdim - 0.5, ydim - 0.5, zdim - 0.5) is the
-// upper bound of the grid (right at the corner).
-//
-// You should NEVER call this function on a grid cell that is either
-// GEOMETRY (obs[pos] == 1) or touching the grid domain. If this is the case
-// then likely the CalcLineTrace function failed and this is a logic bug
-// (CalcLineTrace should stop the line trace BEFORE going into an invalid
-// region).
-//
-// If sample_into_geom is true then we will do bilinear interpolation into
-// neighboring geometry cells (this is done during velocity advection since we
-// set the internal geom velocities to zero out geometry face velocity).
-// Otherwise, we will clamp the scalar field value at the non-geometry boundary.
-static inline real tfluids_(Main_GetInterpValue)(
-    const real * x, const real* obs, const tfluids_(vec3)& pos,
-    const Int3& dims, const bool sample_into_geom) {
-
-  // TODO(tompson,kris): THIS ASSUMES THAT OBSTACLES HAVE ZERO VELOCITY.
-
-  // Make sure we're not against the grid boundary or beyond it.
-  // This is a conservative test (i.e. we test if position is on or beyond it).
-  if (IsOutOfDomainReal(pos, dims)) {
-    printf("ERROR: GetInterpValue called on a point (%f, %f, %f) out of the "
-           "domain!\n", pos.x, pos.y, pos.z);
-    exit(-1);
-  }
-
-  // Get the current integer location of the pixel.
-  int32_t i0, j0, k0;
-  GetPixelCenter(pos, &i0, &j0, &k0);
-  if (tfluids_(IsOutOfDomain(i0, j0, k0, dims))) {
-    printf("ERROR: GetInterpValue pixel center is out of domain!\n");
-    exit(-1);
-  }
-
-  // The current center SHOULD NOT be geometry.
-  if (IsBlockedCell(obs, i0, j0, k0, dims)) {
-    printf("ERROR: GetInterpValue called on a blocked cell!\n");
-    exit(-1);
-  }
-
-  // Calculate the next cell integer to interpolate with AND calculate the
-  // interpolation coefficient.
-
-  // If we're on the left hand size of the grid center we should be
-  // interpolating left (p0) to center (p1), and if we're on the right we
-  // should be interpolating center (p0) to right (p1).
-  // RECALL: (0,0) is defined as the CENTER of the first cell. (xdim - 1,
-  // ydim - 1) is defined as the center of the last cell.
-  real icoef, jcoef, kcoef;
-  int32_t i1, j1, k1;
-  if (pos.x < static_cast<real>(i0)) {
-    i1 = i0;
-    i0 = std::max<int32_t>(i0 - 1, 0);
-  } else {
-    i1 = std::min<int32_t>(i0 + 1, dims.x - 1);
-  }
-  icoef = (i0 == i1) ? static_cast<real>(0) : pos.x - static_cast<real>(i0);
-
-  // Same logic for top / bottom and front / back interp.
-  if (pos.y < static_cast<real>(j0)) {
-    j1 = j0;
-    j0 = std::max<int32_t>(j0 - 1, 0);
-  } else {
-    j1 = std::min<int32_t>(j0 + 1, dims.y - 1);
-  }
-  jcoef = (j0 == j1) ? static_cast<real>(0) : pos.y - static_cast<real>(j0);
-
-  if (pos.z < static_cast<real>(k0)) {
-    k1 = k0;
-    k0 = std::max<int32_t>(k0 - 1, 0);
-  } else {
-    k1 = std::min<int32_t>(k0 + 1, dims.z - 1);
-  }
-  kcoef = (k0 == k1) ? static_cast<real>(0) : pos.z - static_cast<real>(k0);
-
-  if (!(icoef >= 0 && icoef <= 1 && jcoef >= 0 && jcoef <= 1 &&
-        kcoef >= 0 && kcoef <= 1)) {
-    printf("ERROR: mixing coefficients are not in [0, 1]\n");
-    printf("  icoef, jcoef, kcoef = %f, %f, %f.\n", icoef, jcoef, kcoef);
-    exit(-1);
-  }
-
-  if (tfluids_(IsOutOfDomain)(i0, j0, k0, dims) ||
-      tfluids_(IsOutOfDomain)(i1, j1, k1, dims)) {
-    printf("ERROR: interpolation coordinates are out of the domain!.\n");
-    printf("  i0, j0, k0, i1, j1, k1 = %d, %d, %d, %d, %d, %d.\n",
-           i0, j0, k0, i1, j1, k1);
-    exit(-1);
-  }
-
-  // Note: we DO NOT need to handle geometry when doing the trilinear
-  // interpolation:
-  // 1. The particle trace is gaurenteed to return a position that is NOT within
-  // geometry (but can be epsilon away from a geometry wall).
-  // 2. We have called setObstacleBcs prior to running advection which
-  // allows us to interpolate one level into geometry without violating
-  // constraints (it does so by setting geometry velocities such that the face
-  // velocity is zero).
-
-  // Assume a cube with 8 points.
-  // Front face.
-  // Top Front MIX.
-  const real xFrontLeftTop = x[IX(i0, j1, k0, dims)];
-  const bool gFrontLeftTop = IsBlockedCell(obs, i0, j1, k0, dims);
-  const real xFrontRightTop =  x[IX(i1, j1, k0, dims)];
-  const bool gFrontRightTop = IsBlockedCell(obs, i1, j1, k0, dims);
-  real xFrontTopInterp;
-  bool gFrontTopInterp;
-  MixWithGeom(xFrontLeftTop, xFrontRightTop, gFrontLeftTop, gFrontRightTop,
-      sample_into_geom, icoef, &xFrontTopInterp, &gFrontTopInterp);
-
-  // Bottom Front MIX.
-  const real xFrontLeftBottom = x[IX(i0, j0, k0, dims)];
-  const bool gFrontLeftBottom = IsBlockedCell(obs, i0, j0, k0, dims);
-  const real xFrontRightBottom = x[IX(i1, j0, k0, dims)];
-  const bool gFrontRightBottom = IsBlockedCell(obs, i1, j0, k0, dims);
-  real xFrontBottomInterp;
-  bool gFrontBottomInterp;
-  MixWithGeom(
-    xFrontLeftBottom, xFrontRightBottom, gFrontLeftBottom, gFrontRightBottom,
-    sample_into_geom, icoef, &xFrontBottomInterp, &gFrontBottomInterp);
-
-  // Back face.
-  // Top Back MIX.
-  const real xBackLeftTop = x[IX(i0, j1, k1, dims)];
-  const bool gBackLeftTop = IsBlockedCell(obs, i0, j1, k1, dims);
-  const real xBackRightTop = x[IX(i1, j1, k1, dims)];
-  const bool gBackRightTop = IsBlockedCell(obs, i1, j1, k1, dims);
-  real xBackTopInterp;
-  bool gBackTopInterp;
-  MixWithGeom(xBackLeftTop, xBackRightTop, gBackLeftTop, gBackRightTop,
-      sample_into_geom, icoef, &xBackTopInterp, &gBackTopInterp);
-
-  // Bottom Back MIX.
-  const real xBackLeftBottom = x[IX(i0, j0, k1, dims)];
-  const bool gBackLeftBottom = IsBlockedCell(obs, i0, j0, k1, dims);
-  const real xBackRightBottom = x[IX(i1, j0, k1, dims)];
-  const bool gBackRightBottom = IsBlockedCell(obs, i1, j0, k1, dims);
-  real xBackBottomInterp;
-  bool gBackBottomInterp;
-  MixWithGeom(
-      xBackLeftBottom, xBackRightBottom, gBackLeftBottom, gBackRightBottom,
-      sample_into_geom, icoef, &xBackBottomInterp, &gBackBottomInterp);
-
-  // Now get middle of front - The bilinear interp of the front face.
-  real xBiLerpFront;
-  bool gBiLerpFront;
-  MixWithGeom(
-      xFrontBottomInterp, xFrontTopInterp, gFrontBottomInterp, gFrontTopInterp,
-      sample_into_geom, jcoef, &xBiLerpFront, &gBiLerpFront);
-
-  // Now get middle of back - The bilinear interp of the back face.
-  real xBiLerpBack;
-  bool gBiLerpBack;
-  MixWithGeom(
-      xBackBottomInterp, xBackTopInterp, gBackBottomInterp, gBackTopInterp,
-      sample_into_geom, jcoef, &xBiLerpBack, &gBiLerpBack);
-
-  // Now get the interpolated point between the points calculated in the front
-  // and back faces - The trilinear interp part.
-  real xTriLerp;
-  bool gTriLerp;
-  MixWithGeom(xBiLerpFront, xBiLerpBack, gBiLerpFront, gBiLerpBack,
-              sample_into_geom, kcoef, &xTriLerp, &gTriLerp);
-
-  // At least ONE of the samples shouldn't have been geometry so the final value
-  // should be valid.
-  if (gTriLerp) {
-    printf("ERROR: Couldn't find a non-blocked cell. Logic is broken.!\n");
-    exit(-1);
-  }
-
-  return xTriLerp;
-}
-
-static inline void getCurl3D(
-    const real * u, const real * v, const real * w, const int i, const int j,
-    const int k, const Int3& dims, tfluids_(vec3)* curl) {
-  if (tfluids_(IsOutOfDomain(i, j, k, dims))) {
-    printf("Error: getCurl3D called on out of domain index.\n");
-    exit(-1);
-  }
-  if (w == nullptr) {
-    printf("Error: getCurl3D w component is null.\n");
-    exit(-1);
-  }
-  const real half = static_cast<real>(0.5);
-
-  real dwdj, dudj;
-  if (j == 0) {
-    // Single sided diff (pos side).
-    dwdj = GetData(w, i, j + 1, k, dims) - GetData(w, i, j, k, dims);
-    dudj = GetData(u, i, j + 1, k, dims) - GetData(u, i, j, k, dims);
-  } else if (j == dims.y - 1) {
-    // Single sided diff (neg side).
-    dwdj = GetData(w, i, j, k, dims) - GetData(w, i, j - 1, k, dims); 
-    dudj = GetData(u, i, j, k, dims) - GetData(u, i, j - 1, k, dims);
-  } else {
-    // Central diff.
-    dwdj = half * (GetData(w, i, j + 1, k, dims) -
-        GetData(w, i, j - 1, k, dims));
-    dudj = half * (GetData(u, i, j + 1, k, dims) -
-        GetData(u, i, j - 1, k, dims));
-  }
-
-  real dwdi, dvdi;
-  if (i == 0) {
-    // Single sided diff (pos side).
-    dwdi = GetData(w, i + 1, j, k, dims) - GetData(w, i, j, k, dims);
-    dvdi = GetData(v, i + 1, j, k, dims) - GetData(v, i, j, k, dims);
-  } else if (i == dims.x - 1) {
-    // Single sided diff (neg side).
-    dwdi = GetData(w, i, j, k, dims) - GetData(w, i - 1, j, k, dims);
-    dvdi = GetData(v, i, j, k, dims) - GetData(v, i - 1, j, k, dims);
-  } else {
-    // Central diff.
-    dwdi = half * (GetData(w, i + 1, j, k, dims) -
-        GetData(w, i - 1, j, k, dims));
-    dvdi = half * (GetData(v, i + 1, j, k, dims) -
-        GetData(v, i - 1, j, k, dims));
-  }
-
-  real dudk, dvdk;
-  if (k == 0) {
-    // Single sided diff (pos side).
-    dudk = GetData(u, i, j, k + 1, dims) - GetData(u, i, j, k, dims);
-    dvdk = GetData(v, i, j, k + 1, dims) - GetData(v, i, j, k, dims);
-  } else if (k == dims.z - 1) {
-    // Single sided diff (neg side).
-    dudk = GetData(u, i, j, k, dims) - GetData(u, i, j, k - 1, dims);
-    dvdk = GetData(v, i, j, k, dims) - GetData(v, i, j, k - 1, dims);
-  } else {
-    // Central diff.
-    dudk = half * (GetData(u, i, j, k + 1, dims) -
-        GetData(u, i, j, k - 1, dims));
-    dvdk = half * (GetData(v, i, j, k + 1, dims) -
-        GetData(v, i, j, k - 1, dims));
-  }
-
-  curl->x = dwdj - dvdk;
-  curl->y = dudk - dwdi;
-  curl->z = dvdi - dudj;
-}
-
-static inline real getCurl2D(
-    const real * u, const real * v, const int i, const int j,
-    const Int3& dims) {
-  if (dims.z != 1) {
-    printf("Error: input dimensions are not 2D.\n");
-    exit(-1);
-  }
-  if (tfluids_(IsOutOfDomain(i, j, 0, dims))) {
-    printf("Error: getCurl2D called on out of bounds index.\n");
-    exit(-1);
-  }
-  const real half = static_cast<real>(0.5);
-  const int32_t k = 0;
-  
-  real dvdi;
-  if (i == 0) {
-    // Single sided diff (pos side).
-    dvdi = GetData(v, i + 1, j, k, dims) - GetData(v, i, j, k, dims);
-  } else if (i == dims.x - 1) {
-    // Single sided diff (neg side).
-    dvdi = GetData(v, i, j, k, dims) - GetData(v, i - 1, j, k, dims);
-  } else {
-    // Central diff.
-    dvdi = half * (GetData(v, i + 1, j, k, dims) -
-        GetData(v, i - 1, j, k, dims));
-  }
-
-  real dudj;
-  if (j == 0) {
-    // Single sided diff (pos side).
-    dudj = GetData(u, i, j + 1, k, dims) - GetData(u, i, j, k, dims);
-  } else if (j == dims.y - 1) {
-    // Single sided diff (neg side).
-    dudj = GetData(u, i, j, k, dims) - GetData(u, i, j - 1, k, dims);
-  } else {
-    // Central diff.
-    dudj = half * (GetData(u, i, j + 1, k, dims) -
-        GetData(u, i, j - 1, k, dims));
-  }
-
-  return dudj - dvdi;
-}
-
-// This function is taken from CNNFluids/fluid_solver/second_order_solver.h and
-// modified.
-//
-// @param dt - Time step.
-// @param scale - scale of confinement force.  Higher is stronger/more curl.
-// @param u, v, w - The input velocity field, from which force 
-// and curl will be calculated. Note: param w is OPTIONAL, it can be nullptr 
-// when we're using 2D systems.
-// @param obs - The input occupancy grid (1.0f == occupied, 0.0f == empty).
-// @param dims - The input dimension {x=xdim, y=ydim, z=zdim}.
-// @param curl_u, curl_v, curl_w, mag_curl - Temporary space the same size as
-// u, v, w.
-//
-// Note: param w is OPTIONAL, it can be nullptr when we're using 2D systems.
-//
-// Note: All fields are assumed to be laid out xdim first, ydim second, zdim
-// third (outer), see IX() for index lookup.
-static void tfluids_(Main_vorticityConfinement)(
-  const real dt, const real scale, real* u, real* v, real* w, const real* obs,
-  const Int3& dims, real* curl_u, real* curl_v, real* curl_w, real* mag_curl) {
-  const bool two_dim = w == nullptr;
-  if (!(two_dim == (curl_w == nullptr))) {
-    printf("Error: vorticityConfinement two_ddim does not match 'w' input.\n");
-    exit(-1);
-  }
-
-  const real half = static_cast<real>(0.5);
-
-  if (!(dims.x > 2 && dims.y > 2)) {
-    printf("Error: vorticityConfinement x and y dim are too small.\n");
-    exit(-1);
-  }
-  if (!two_dim && dims.z <= 2) {
-    printf("Error: vorticityConfinement z dim is too small.\n");
-    exit(-1);
-  }
-
-  // As a pre-step, calculate curl in each cell.
-  int32_t k, j, i;
-  #pragma omp parallel for collapse(3) private(k, j, i)
-  for (k = 0; k < dims.z; k++) {
-    for (j = 0; j < dims.y; j++) {
-      for (i = 0; i < dims.x; i++) {
-        if (two_dim) {
-          // The curl in 2D is a scalar value.
-          const real curl = getCurl2D(u, v, i, j, dims);
-          curl_u[IX(i, j, k, dims)] = curl;
-          // L2 magnitude of a scalar field is just L1.
-          mag_curl[IX(i, j, k, dims)] = std::fabs(curl);
-        } else {
-          // The curl in 3D is a vector value.
-          tfluids_(vec3) curl;
-          getCurl3D(u, v, w, i, j, k, dims, &curl);
-          curl_u[IX(i, j, k, dims)] = curl.x;
-          curl_v[IX(i, j, k, dims)] = curl.y;
-          curl_w[IX(i, j, k, dims)] = curl.z;
-          mag_curl[IX(i, j, k, dims)] = tfluids_(length3)(curl);
-        }
-      }
-    }
-  }
-
-  // Now perform the vorticity confinement for internal cells (ignore
-  // border cells).
-  // TODO(tompson,kris): Handle geometry properly.
-  // TODO(tompson,kris): You can also do the internal cells because we have
-  // single sided FEM approx.
-  
-  const int kStart = two_dim ? 0 : 1;
-  const int kEnd = two_dim ? 1 : (dims.z - 1);
-
-#pragma omp parallel for collapse(3) private(k, j, i)
-  for (k = kStart; k < kEnd; k++) {
-    for (j = 1; j < dims.y - 1; j++) {
-      for (i = 1; i < dims.x - 1; i++) {
-        // Don't perform any confinement in an obstacle.
-        if (IsBlockedCell(obs, i, j, k, dims)) {
-          continue;
-        }
-        // Don't perform any confinement in a cell that borders an obstacle.
-        // TODO(tompson): Not sure if this is correct. It's probably OK for now
-        // only because the partial derivative for ||w|| is invalid for cells
-        // that lie next to a geometry cell.
-        if (IsBlockedCell(obs, i - 1, j, k, dims) ||
-            IsBlockedCell(obs, i + 1, j, k, dims) ||
-            IsBlockedCell(obs, i, j - 1, k, dims) ||
-            IsBlockedCell(obs, i, j + 1, k, dims) ||
-            (!two_dim && IsBlockedCell(obs, i, j, k - 1, dims)) ||
-            (!two_dim && IsBlockedCell(obs, i, j, k + 1, dims))) {
-          continue;
-        }
-
-        tfluids_(vec3) force;
-        if (two_dim) {
-          // Find derivative of the magnitude of curl (n = grad |w|).
-          // Where 'w' is the curl calculated above.
-          real dwdi = half * (mag_curl[IX(i + 1, j, k, dims)] -
-              mag_curl[IX(i - 1, j, k, dims)]);
-          real dwdj = half * (mag_curl[IX(i, j + 1, k, dims)] -
-              mag_curl[IX(i, j - 1, k, dims)]);
-
-          const real length_sq = dwdi * dwdi + dwdj * dwdj;
-          const real length =
-              (length_sq > std::numeric_limits<real>::epsilon()) ?
-              std::sqrt(length_sq) : static_cast<real>(0);
-          if (length > static_cast<real>(1e-6)) {
-            dwdi /= length;
-            dwdj /= length;
-          }
-
-          const real v = curl_u[IX(i, j, k, dims)];
-
-          // N x w.
-          force.x = dwdj * (-v);
-          force.y = dwdi * v;
-          force.z = static_cast<real>(0);
-        } else {
-          // Find derivative of the magnitude of curl (n = grad |w|).
-          // Where 'w' is the curl calculated above.
-         
-          // Calculate magnitude gradient (grad |w|) using FEM central diff.
-          real dwdi = half * (mag_curl[IX(i + 1, j, k, dims)] -
-              mag_curl[IX(i - 1, j, k, dims)]);
-          real dwdj = half * (mag_curl[IX(i, j + 1, k, dims)] -
-              mag_curl[IX(i, j - 1, k, dims)]);
-          real dwdk = half * (mag_curl[IX(i, j, k + 1, dims)] -
-              mag_curl[IX(i, j, k - 1, dims)]);
-
-          const real length_sq = dwdi * dwdi + dwdj * dwdj + dwdk * dwdk;
-          const real length =
-              (length_sq > std::numeric_limits<real>::epsilon()) ?
-              std::sqrt(length_sq) : static_cast<real>(0);
-          if (length > static_cast<real>(1e-6)) {
-            dwdi /= length;
-            dwdj /= length;
-            dwdk /= length;
-          }
-
-          tfluids_(vec3) N;
-          N.x = dwdi;
-          N.y = dwdj;
-          N.z = dwdk;
-
-          tfluids_(vec3) curl;
-          curl.x = curl_u[IX(i, j, k, dims)];
-          curl.y = curl_v[IX(i, j, k, dims)];
-          curl.z = curl_w[IX(i, j, k, dims)];
-
-          tfluids_(cross3)(N, curl, &force);
-        }
-
-        // Now apply the force.
-        u[IX(i, j, k, dims)] += force.x * scale * dt;
-        v[IX(i, j, k, dims)] += force.y * scale * dt;
-        if (!two_dim) {
-          w[IX(i, j, k, dims)] += force.z * scale * dt;
-        }
-      }
-    }
-  }
-}
-
-// A hard-coded Gaussian kernel. Use AveKernel.m to calculate the values.
-#ifndef TFLUIDS_KERNEL
-#define TFLUIDS_KERNEL
-const int32_t kern_rad = 1;
-const int32_t kern_sz = kern_rad * 2 + 1;
-const int32_t kern_numel = kern_sz * kern_sz * kern_sz;
-#endif
-const real tfluids_(kernel)[kern_numel] = {
-    6.5880001e-05, 1.4994219e-03, 6.5880001e-05,
-    1.4994219e-03, 3.4126686e-02, 1.4994219e-03,
-    6.5880001e-05, 1.4994219e-03, 6.5880001e-05,
-    1.4994219e-03, 3.4126686e-02, 1.4994219e-03,
-    3.4126686e-02, 7.7671978e-01, 3.4126686e-02,
-    1.4994219e-03, 3.4126686e-02, 1.4994219e-03,
-    6.5880001e-05, 1.4994219e-03, 6.5880001e-05,
-    1.4994219e-03, 3.4126686e-02, 1.4994219e-03,
-    6.5880001e-05, 1.4994219e-03, 6.5880001e-05};
-
-// The final sampling of the velocity field (after doing the backwards trace).
-static real sampleField(const real* field, const tfluids_(vec3)& pos,
-                        const real* obs, const Int3& dims,
-                        const bool sample_into_geom) {
-  return tfluids_(Main_GetInterpValue)(field, obs, pos, dims, sample_into_geom);
-}
-
-// Advect a scalar field along the velocity field using a first order
-// Semi-Lagrangian (Euler) step.
-//
-// @param dt - Time step.
-// @param q_src - The input scalar field to advect.
-// @param u, v, w - The input velocity field, from which to advect q_src. Note:
-// param w is OPTIONAL, it can be nullptr when we're advecting 2D systems.
-// @param obs - The input occupancy grid (1.0f == occupied, 0.0f == empty).
-// @param dims - The input dimension {x=xdim, y=ydim, z=zdim}.
-// @param q_dst - The output advected scalar field.
-//
-// Note: All fields are assumed to be laid out xdim first, ydim second, zdim
-// third (outer), see IX() for index lookup.
-static void tfluids_(Main_advectScalarEuler)(
-    const real dt, const real* q_src, const real* u, const real* v,
-    const real* w, const real* obs, const Int3& dims, real* q_dst,
-    const bool sample_into_geom) {
-  int32_t k, j, i;
-  const real ndt = -dt;
-  const bool two_dim = w == nullptr;
-#pragma omp parallel for collapse(3) private(k, j, i)
-  for(k = 0; k < dims.z; k++) {
-    for(j = 0; j < dims.y; j++) {
-      for(i = 0; i < dims.x; i++) {
-        if (IsBlockedCell(obs, i, j, k, dims)) {
-          // Don't advect blocked cells.
-          continue;
-        }
-
-        // NOTE: The integer positions are in the center of the grid cells.
-        tfluids_(vec3) pos;
-        pos.x = static_cast<real>(i);
-        pos.y = static_cast<real>(j);
-        pos.z = static_cast<real>(k);
-
-        // Velocity is in grids / second.
-        tfluids_(vec3) vel;
-        vel.x = u[IX(i, j, k, dims)];
-        vel.y = v[IX(i, j, k, dims)];
-        vel.z = two_dim ? static_cast<real>(0) : w[IX(i, j, k, dims)];
-
-        // Backtrace based upon current velocity at cell center.
-        tfluids_(vec3) back_pos;
-        tfluids_(vec3) displacement;
-        displacement.x = (ndt * vel.x);
-        displacement.y = (ndt * vel.y);
-        displacement.z = (ndt * vel.z);
-        // Step along the displacement vector. calcLineTrace will handle
-        // boundary conditions for us. Note: it will terminate BEFORE the
-        // boundary (i.e. the returned position is always valid).
-        const bool hit_boundary = calcLineTrace(pos, displacement, dims, obs,
-                                                back_pos);
-
-        // Check the return value from calcLineTrace just in case.
-        if (IsOutOfDomainReal(back_pos, dims) ||
-            IsBlockedCellReal(obs, back_pos, dims)) {
-          printf("Error: advectScalarEuler - calcLineTrace returned an "
-                 "invalid cell (back_pos).\n");
-          exit(-1);
-        }
-
-
-        // Finally, sample the value at the new position.
-        q_dst[IX(i, j, k, dims)] = sampleField(q_src, back_pos, obs, dims,
-                                               sample_into_geom);
-      }
-    }
-  }
-}
-
-// Second order version of the above function.
-static void tfluids_(Main_advectScalarRK2)(
-    const real dt, const real* q_src, const real* u, const real* v,
-    const real* w, const real* obs, const Int3& dims, real* q_dst,
-    const bool sample_into_geom) {
-  int32_t k, j, i;
-  const real ndt = -dt;
-  const bool two_dim = w == nullptr;
-#pragma omp parallel for collapse(3) private(k, j, i)
-  for(k = 0; k < dims.z; k++) { 
-    for(j = 0; j < dims.y; j++) { 
-      for(i = 0; i < dims.x; i++) {
-        if (IsBlockedCell(obs, i, j, k, dims)) {
-          // Don't advect blocked cells.
-          continue;
-        }
-
-        // NOTE: The integer positions are in the center of the grid cells.
-        tfluids_(vec3) pos;
-        pos.x = static_cast<real>(i);
-        pos.y = static_cast<real>(j);
-        pos.z = static_cast<real>(k);
-
-        // Velocity is in grids / second.
-        tfluids_(vec3) vel;
-        vel.x = u[IX(i, j, k, dims)];
-        vel.y = v[IX(i, j, k, dims)];
-        vel.z = two_dim ? static_cast<real>(0) : w[IX(i, j, k, dims)];
-
-        // Backtrace a half step based upon current velocity at cell center.
-        tfluids_(vec3) half_pos;
-        tfluids_(vec3) displacement;
-        displacement.x = (static_cast<real>(0.5) * ndt * vel.x);
-        displacement.y = (static_cast<real>(0.5) * ndt * vel.y);
-        displacement.z = (static_cast<real>(0.5) * ndt * vel.z);
-        const bool hit_boundary_half =
-            calcLineTrace(pos, displacement, dims, obs, half_pos);
-
-
-        // Check the return value from calcLineTrace just in case.
-        if (IsOutOfDomainReal(half_pos, dims) ||
-            IsBlockedCellReal(obs, half_pos, dims)) {
-          printf("Error: advectScalarRK2 - calcLineTrace returned an "
-                 "invalid cell (half_pos).\n");
-          exit(-1);
-        }
-
-
-        if (hit_boundary_half) {
-          // We hit the boundary, then as per Bridson, we should clamp the
-          // backwards trace. Note: if we treated this as a full euler step, we 
-          // would have hit the same blocker because the line trace is linear.
-          // TODO(tompson,kris): I'm pretty sure this is the best we could do
-          // but I still worry about numerical stability.
-          q_dst[IX(i, j, k, dims)] = sampleField(q_src, half_pos, obs, dims,
-                                                 sample_into_geom);
-          continue;
-        }
-
-        // Sample the velocity at this half step location.
-        vel.x = sampleField(u, half_pos, obs, dims, true);
-        vel.y = sampleField(v, half_pos, obs, dims, true);
-        if (!two_dim) {
-          vel.z = sampleField(w, half_pos, obs, dims, true);
-        } else {
-          vel.z = static_cast<real>(0);
-        }
-
-        // Do another line trace using this half position's velocity.
-        tfluids_(vec3) back_pos;
-        displacement.x = (ndt * vel.x);
-        displacement.y = (ndt * vel.y);
-        displacement.z = (ndt * vel.z);
-        const bool hit_boundary = calcLineTrace(pos, displacement, dims, obs,
-                                                back_pos);
-
-        // Again, check the return value from calcLineTrace just in case.
-        if (IsOutOfDomainReal(back_pos, dims) ||
-            IsBlockedCellReal(obs, back_pos, dims)) {
-          printf("Error: advectScalarRK2 - calcLineTrace returned an "
-                 "invalid cell (back_pos).\n");
-          exit(-1);
-        }
-
-        // Sample the value at the new position.
-        q_dst[IX(i, j, k, dims)] = sampleField(q_src, back_pos, obs, dims,
-                                               sample_into_geom);
-      }
-    }
-  }
-}
-
-// Perform a self-advection of the input velocity field using a first order
-// (Euler) step.
-//
-// @param w - OPTIONAL: For 2D systems this can be nullptr. If w is nullptr
-// then w_dst must also be nullptr.
-//
-// TODO(tompson,kris): Refactor this so that the velocity and scalar functions
-// don't have code duplication.
-static void tfluids_(Main_advectVelEuler)(
-    const real dt, const real* u, const real* v, const real* w,
-    const real* obs, const Int3& dims, real* u_dst, real* v_dst, real* w_dst) {
-  const real ndt = -dt;
-  const bool two_dim = w == nullptr;
-  if (!(two_dim == (w_dst == nullptr))) {
-    printf("Error: advectVelEuler two_dim does not match 'w'.\n");
-    exit(-1);
-  }
-  // TODO(tompson,kris): ALLOW FOR DYNAMIC OBSTACLES. Right now we are
-  // assuming that obstacles have zero velocity
-  int32_t k, j, i;
-#pragma omp parallel for collapse(3) private(k, j, i)
-  for(k = 0; k < dims.z; k++) { 
-    for(j = 0; j < dims.y; j++) { 
-      for(i = 0; i < dims.x; i++) {
-        if (IsBlockedCell(obs, i, j, k, dims)) {
-          // Don't advect blocked cells.
-          continue;
-        }
-
-        // NOTE: The integer positions are in the center of the grid cells.
-        tfluids_(vec3) pos;
-        pos.x = static_cast<real>(i);
-        pos.y = static_cast<real>(j);
-        pos.z = static_cast<real>(k);
-
-        // Velocity is in grids / second.
-        tfluids_(vec3) vel;
-        vel.x = u[IX(i, j, k, dims)];
-        vel.y = v[IX(i, j, k, dims)];
-        vel.z = two_dim ? static_cast<real>(0) : w[IX(i, j, k, dims)];
-
-        // Backtrace based upon current velocity at cell center.
-        tfluids_(vec3) back_pos;
-        tfluids_(vec3) displacement;
-        displacement.x = (ndt * vel.x);
-        displacement.y = (ndt * vel.y);
-        displacement.z = (ndt * vel.z);
-        // Step along the displacement vector. calcLineTrace will handle
-        // boundary conditions for us. Note: it will terminate BEFORE the
-        // boundary (i.e. the returned position is always valid).
-        const bool hit_boundary = calcLineTrace(pos, displacement, dims, obs,
-                                                back_pos);
-
-        // Check the return value from calcLineTrace just in case.
-        if (IsOutOfDomainReal(back_pos, dims) ||
-            IsBlockedCellReal(obs, back_pos, dims)) {
-          printf("Error: advectVelEuler - calcLineTrace returned an "
-                 "invalid cell (back_pos).\n");
-          exit(-1);
-        }
-
-        // Finally, sample the value at the new position.
-        u_dst[IX(i, j, k, dims)] = sampleField(u, back_pos, obs, dims, true);
-        v_dst[IX(i, j, k, dims)] = sampleField(v, back_pos, obs, dims, true);
-        if (!two_dim) {
-          w_dst[IX(i, j, k, dims)] = sampleField(w, back_pos, obs, dims, true);
-        }
-      }
-    }
-  }
-}
-
-// Second order (RK2) version of the self-advection function.
-static void tfluids_(Main_advectVelRK2)(
-    const real dt, const real* u, const real* v, const real* w,
-    const real* obs, const Int3& dims, real* u_dst, real* v_dst, real* w_dst) {
-  const real ndt = -dt;
-  const bool two_dim = w == nullptr;
-  if (!(two_dim == (w_dst == nullptr))) {
-    printf("Error: advectVelRK2 two_dim does not match 'w'.\n");
-    exit(-1);
-  }
-  // TODO(tompson,kris): ALLOW FOR DYNAMIC OBSTACLES. Right now we are
-  // assuming that obstacles have zero velocity
-  int32_t k, j, i;
-#pragma omp parallel for collapse(3) private(k, j, i)
-  for(k = 0; k < dims.z; k++) { 
-    for(j = 0; j < dims.y; j++) { 
-      for(i = 0; i < dims.x; i++) {
-        if (IsBlockedCell(obs, i, j, k, dims)) {
-          // Don't advect blocked cells.
-          continue;
-        }
-
-        // NOTE: The integer positions are in the center of the grid cells.
-        tfluids_(vec3) pos;
-        pos.x = static_cast<real>(i);
-        pos.y = static_cast<real>(j);
-        pos.z = static_cast<real>(k);
-
-        // Velocity is in grids / second.
-        tfluids_(vec3) vel;
-        vel.x = u[IX(i, j, k, dims)];
-        vel.y = v[IX(i, j, k, dims)];
-        vel.z = two_dim ? static_cast<real>(0) : w[IX(i, j, k, dims)];
-
-        // Backtrace a half step based upon current velocity at cell center.
-        tfluids_(vec3) half_pos;
-        tfluids_(vec3) displacement;
-        displacement.x = (static_cast<real>(0.5) * ndt * vel.x);
-        displacement.y = (static_cast<real>(0.5) * ndt * vel.y);
-        displacement.z = (static_cast<real>(0.5) * ndt * vel.z);
-        const bool hit_boundary_half =
-            calcLineTrace(pos, displacement, dims, obs, half_pos);
-
-        // Check the return value from calcLineTrace just in case.
-        if (IsOutOfDomainReal(half_pos, dims) ||
-            IsBlockedCellReal(obs, half_pos, dims)) {
-          printf("Error: advectVelRK2 - calcLineTrace returned an "
-                 "invalid cell (half_pos).\n");
-          exit(-1);
-        }
-
-        if (hit_boundary_half) {
-          u_dst[IX(i, j, k, dims)] = sampleField(u, half_pos, obs, dims, true);
-          v_dst[IX(i, j, k, dims)] = sampleField(v, half_pos, obs, dims, true);
-          if (!two_dim) {
-            if (w_dst == nullptr) {
-              printf("ERROR: null w component found!\n");
-              exit(-1);
-            }
-            w_dst[IX(i, j, k, dims)] = sampleField(w, half_pos, obs, dims,
-                                                   true);
-          }
-          continue;
-        }
-
-        // Sample the velocity at this half step location.
-        vel.x = sampleField(u, half_pos, obs, dims, true);
-        vel.y = sampleField(v, half_pos, obs, dims, true);
-        if (!two_dim) {
-          vel.z = sampleField(w, half_pos, obs, dims, true);
-        } else {
-          vel.z = static_cast<real>(0);
-        }
-
-        // Do another line trace using this half position's velocity.
-        tfluids_(vec3) back_pos;
-        displacement.x = (ndt * vel.x);
-        displacement.y = (ndt * vel.y);
-        displacement.z = (ndt * vel.z);
-        const bool hit_boundary = calcLineTrace(pos, displacement, dims, obs,
-                                                back_pos);
-
-        // Again, check the return value from calcLineTrace just in case.
-        if (IsOutOfDomainReal(back_pos, dims) ||
-            IsBlockedCellReal(obs, back_pos, dims)) {
-          printf("Error: advectVelRK2 - calcLineTrace returned an "
-                 "invalid cell (back_pos).\n");
-          exit(-1);
-        }
-
-        // Sample the value at the new position.
-        u_dst[IX(i, j, k, dims)] = sampleField(u, back_pos, obs, dims, true);
-        v_dst[IX(i, j, k, dims)] = sampleField(v, back_pos, obs, dims, true);
-        if (!two_dim) {
-          if (w_dst == nullptr) {
-            printf("ERROR: null w component found!\n");
-            exit(-1);
-          }
-          w_dst[IX(i, j, k, dims)] = sampleField(w, back_pos, obs, dims, true);
-        }
-      }
-    }
-  }
-}
-
 // *****************************************************************************
 // LUA MAIN ENTRY POINT FUNCTIONS
 // *****************************************************************************
+
+inline real SemiLagrange(tfluids_(FlagGrid)& flags, tfluids_(MACGrid)& vel,
+                         tfluids_(RealGrid)& src, real dt, bool is_levelset,
+                         int order_space, int32_t i, int32_t j, int32_t k) {
+  const real p5 = static_cast<real>(0.5);
+  tfluids_(vec3) pos =
+      (tfluids_(vec3)((real)i + p5, (real)j + p5, (real)k + p5) -
+       vel.getCentered(i,j,k) * dt);
+  return src.getInterpolatedHi(pos, order_space);
+}
+
+inline real MacCormackCorrect(tfluids_(FlagGrid)& flags, const real old,
+                              const real fwd, const real bwd,
+                              const real strength, bool is_levelset,
+                              int32_t i, int32_t j, int32_t k) {
+  real dst = fwd;
+
+  if (flags.isFluid(i, j, k)) {
+    // Only correct inside fluid region.
+    dst += strength * 0.5 * (old - bwd);
+  }
+  return dst;
+}
 
 static int tfluids_(Main_advectScalar)(lua_State *L) {
   // Get the args from the lua stack. NOTE: We do ALL arguments (size checking)
   // on the lua stack. We also treat 2D advection as 3D (with depth = 1) and
   // no 'w' component for velocity.
   real dt = static_cast<real>(lua_tonumber(L, 1));
-  THTensor* p =
+  THTensor* tensor_s =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 2, torch_Tensor));
-  THTensor* u =
+  THTensor* tensor_u =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 3, torch_Tensor));
-  THTensor* geom =
+  THTensor* tensor_flags =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 4, torch_Tensor));
-  THTensor* p_dst =
+  THTensor* tensor_s_tmp =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 5, torch_Tensor));
-  const std::string method = static_cast<std::string>(lua_tostring(L, 6));
-  const bool sample_into_geom = static_cast<bool>(lua_toboolean(L, 7));
+  const bool is_3d = static_cast<bool>(lua_toboolean(L, 6));
+  const std::string method = static_cast<std::string>(lua_tostring(L, 7));
+  const bool open_bounds = static_cast<bool>(lua_toboolean(L, 8));
+  const int32_t boundary_width = static_cast<int32_t>(lua_tointeger(L, 9));
+  THTensor* tensor_s_dst =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 10, torch_Tensor));
 
-  bool two_dim = u->size[0] == 2;
-  const int32_t xdim = static_cast<int32_t>(geom->size[2]);
-  const int32_t ydim = static_cast<int32_t>(geom->size[1]);
-  const int32_t zdim = static_cast<int32_t>(geom->size[0]);
-
-  // Get pointers to the tensor data.
-  const real* p_data = THTensor_(data)(p);
-  const real* u_data = THTensor_(data)(u);
-  const real* geom_data = THTensor_(data)(geom);
-  real* p_dst_data = THTensor_(data)(p_dst);
-
-  const real* ux_data = &u_data[0 * xdim * ydim * zdim];
-  const real* uy_data = &u_data[1 * xdim * ydim * zdim];
-  const real* uz_data = two_dim ? nullptr : &u_data[2 * xdim * ydim * zdim];
-
-  // Finally, call the advection routine.
-  Int3 dim;
-  dim.x = xdim;
-  dim.y = ydim;
-  dim.z = zdim;
-  if (method == "rk2") { 
-    tfluids_(Main_advectScalarRK2)(dt, p_data, ux_data, uy_data, uz_data,
-                                   geom_data, dim, p_dst_data,
-                                   sample_into_geom);
-  } else if (method == "euler") {
-    tfluids_(Main_advectScalarEuler)(dt, p_data, ux_data, uy_data, uz_data,
-                                     geom_data, dim, p_dst_data,
-                                     sample_into_geom);
-  } else if (method == "maccormack") {
-    luaL_error(L, "maccormack not yet implemented.");
-  } else {
-    luaL_error(L, "Invalid advection method.");
+  // Note: all the checks for sizes and dim are done in init.lua, we're going
+  // to do a few here just because we're paranoid.
+  if (tensor_u->nDimension != 4) {
+    luaL_error(L, "u is not 4D.");
   }
+  if (is_3d && tensor_u->size[0] != 3) {
+    luaL_error(L, "3D u does not have 3 channels!");
+  }
+  if (!is_3d && tensor_u->size[0] != 2) {
+    luaL_error(L, "2D u does not have 2 channels!");
+  }
+  const int32_t xdim = static_cast<int32_t>(tensor_u->size[3]);
+  const int32_t ydim = static_cast<int32_t>(tensor_u->size[2]);
+  const int32_t zdim = static_cast<int32_t>(tensor_u->size[1]);
+
+  if (!is_3d && zdim != 1) {
+    luaL_error(L, "2D u does not have unit z dimension!");
+  }
+
+  // Wrap the data round our structs (no copy or alloc).
+  tfluids_(FlagGrid) flags(tensor_flags, is_3d);
+  tfluids_(MACGrid) vel(tensor_u, is_3d);
+  tfluids_(RealGrid) src(tensor_s, is_3d);
+  tfluids_(RealGrid) dst(tensor_s_dst, is_3d);
+  tfluids_(RealGrid) fwd(tensor_s_tmp, is_3d);
   
+  if (method != "maccormack" && method != "euler") {
+    luaL_error(L, "advectScalar method is not supported.");
+  }
+
+  const int32_t order = method == "euler" ? 1 : 2;
+  const bool is_levelset = false;  // We never advect them.
+  const int order_space = 1;
+
+  int32_t k, j, i;
+  const int32_t bnd = 1;
+#pragma omp parallel for collapse(3) private(k, j, i)
+  for(k = 0; k < zdim; k++) {
+    for(j = 0; j < ydim; j++) {
+      for(i = 0; i < xdim; i++) {
+        if (i < bnd || i > xdim - 1 - bnd ||
+            j < bnd || j > ydim - 1 - bnd ||
+            (is_3d && (k < bnd || k > zdim - 1 - bnd))) {
+          dst(i, j, k) = 0;  // Manta zeros stuff on the border.
+          continue;
+        }
+
+        // Forward step.
+        const real val = SemiLagrange(flags, vel, src, dt, is_levelset,
+                                      order_space, i, j, k); 
+
+        if (order == 1) {
+          dst(i, j, k) = val;  // Store in the output array
+        } else {
+          fwd(i, j, k) = val;  // Store in the fwd array.
+        }
+      }
+    }
+  }
+
+  if (order == 1) {
+    // We're done. The forward Euler step is already in the output array.
+    return 0;
+  }
+
+  // Otherwise we need to do the backwards step (which is a SemiLagrange step
+  // on the forward data - hence we needed to finish the above loops before
+  // moving on).
+  const real strength = static_cast<real>(1);
+#pragma omp parallel for collapse(3) private(k, j, i)
+  for(k = 0; k < zdim; k++) { 
+    for(j = 0; j < ydim; j++) { 
+      for(i = 0; i < xdim; i++) {
+        if (i < bnd || i > xdim - 1 - bnd ||
+            j < bnd || j > ydim - 1 - bnd ||
+            (is_3d && (k < bnd || k > zdim - 1 - bnd))) {
+          continue; 
+        } 
+
+        const real orig = src(i, j, k);
+        const real fwd_val = fwd(i, j, k);
+
+        // Backwards step.
+        const real bwd = SemiLagrange(flags, vel, fwd, -dt, is_levelset,
+                                      order_space, i, j, k);
+        
+        // compute correction.
+        // TODO(tompson): This kernel is on the entire domain in Manta but not
+        // here.
+        const real val = MacCormackCorrect(flags, orig, fwd_val, bwd, strength,
+                                           is_levelset, i, j, k); 
+
+        // clamp vals.
+        // TODO(tompson): This kernel is on the entire domain in Manta but not
+        // here.
+//        MacCormackClamp(flags, vel, newGrid, orig, fwd, dt);
+        dst(i, j, k) = val;
+      }
+    }
+  }
+
   return 0;  // Recall: number of return values on the lua stack.
 }
-
+/*
 static int tfluids_(Main_advectVel)(lua_State *L) {
   // Get the args from the lua stack. NOTE: We do ALL arguments (size checking)
   // on the lua stack. We also treat 2D advection as 3D (with depth = 1) and
@@ -1069,178 +310,7 @@ static int tfluids_(Main_vorticityConfinement)(lua_State *L) {
   return 0;  // Number of return values on the lua stack.
 }
 
-static int tfluids_(Main_averageBorderCells)(lua_State *L) {
-  THTensor* in =
-      reinterpret_cast<THTensor*>(luaT_checkudata(L, 1, torch_Tensor));
-  THTensor* geom =
-      reinterpret_cast<THTensor*>(luaT_checkudata(L, 2, torch_Tensor));
-  THTensor* out =
-      reinterpret_cast<THTensor*>(luaT_checkudata(L, 3, torch_Tensor));
-  if (in->nDimension != 4 || geom->nDimension != 3) {
-    luaL_error(L, "Input tensor should be 4D and geom should be 3D");
-  }
-  const int32_t nchan = in->size[0];
-  const int32_t zdim = in->size[1];
-  const int32_t ydim = in->size[2];
-  const int32_t xdim = in->size[3];
-
-  const bool two_dim = zdim == 1;
-
-  real* in_data = THTensor_(data)(in);
-  real* out_data = THTensor_(data)(out);
-  real* geom_data = THTensor_(data)(geom);
-
-  // Average the pixels in a neighborhood. We want the average to be
-  // symmetric and so should be all surrounding neighbors.
-  // Store the result in out.
-  int32_t c, z, y, x, zoff, yoff, xoff;
-#pragma omp parallel for private(c,z,y,x,zoff,yoff,xoff) collapse(4)
-  for (c = 0; c < nchan; c++) {
-    for (z = 0; z < zdim; z++) {
-      for (y = 0; y < ydim; y++) {
-        for (x = 0; x < xdim; x++) {
-          const int32_t idst = (c * xdim * ydim * zdim) + (z * xdim * ydim) +
-              (y * xdim) + x;
-          if ((!two_dim && (z == 0 || z == (zdim - 1))) ||
-              y == 0 || y == (ydim - 1) ||
-              x == 0 || x == (xdim - 1)) {
-            // We're a border pixel.
-            // TODO(tompson): This is an O(n^3) iteration to find a small
-            // sub-set of the pixels. Fix it.
-            real mean = 0;
-            int32_t count = 0;
-            // Count and sum the number of non-geometry and in-boundary pixels.
-            for (zoff = z - 1; zoff <= z + 1; zoff++) {
-              for (yoff = y - 1; yoff <= y + 1; yoff++) {
-                for (xoff = x - 1; xoff <= x + 1; xoff++) {
-                  if (zoff >= 0 && zoff < zdim &&
-                      yoff >= 0 && yoff < ydim &&
-                      xoff >= 0 && xoff < xdim) {
-                    // The neighbor is on the image.
-                    const int32_t ipix = (zoff * xdim * ydim) + (yoff * xdim) +
-                        xoff;
-                    if (geom_data[ipix] < static_cast<real>(1e-6)) {
-                      // The neighbor is NOT geometry.
-                      count++;
-                      mean += in_data[(c * xdim * ydim * zdim) + ipix];
-                    }
-                  }
-                }
-              }
-            }
-            if (count > 0) {
-              out_data[idst] = mean / static_cast<real>(count);
-            } else {
-              // No non-geom pixels found. Just copy over result.
-              out_data[idst] = in_data[idst];
-            }
-          } else {
-            // Internal cell, just copy the result.
-            out_data[idst] = in_data[idst];
-          }
-        }
-      }
-    }
-  }
-
-  return 0;
-}
-
-static int tfluids_(Main_setObstacleBcs)(lua_State *L) {
-  THTensor* U =
-      reinterpret_cast<THTensor*>(luaT_checkudata(L, 1, torch_Tensor));
-  THTensor* geom =
-      reinterpret_cast<THTensor*>(luaT_checkudata(L, 2, torch_Tensor));
- 
-  if (U->nDimension != 4 || geom->nDimension != 3) {
-    luaL_error(L, "Input U should be 4D and geom should be 3D");
-  }
-  const bool two_dim = U->size[0] == 2;
-  if (!two_dim && U->size[0] != 3) {
-    luaL_error(L, "Unexpected size 1 for the U tensor.");
-  }
-  const int32_t zdim = U->size[1];
-  const int32_t ydim = U->size[2];
-  const int32_t xdim = U->size[3];
-  Int3 dims;
-  dims.x = xdim;
-  dims.y = ydim;
-  dims.z = zdim;
-
-  if (geom->size[0] != zdim || geom->size[1] != ydim || geom->size[2] != xdim) {
-    luaL_error(L, "Inconsistent geometry size.");
-  }
-
-  if (two_dim && zdim != 1) {
-    luaL_error(L, "2D input does not have zdim == 1.");
-  }
-
-  real* u_data = THTensor_(data)(U);
-  real* ux_data = &u_data[0];
-  real* uy_data = &u_data[xdim * ydim * zdim];
-  real* uz_data;
-  if (!two_dim) {
-    uz_data = &u_data[2 * xdim * ydim * zdim];
-  }
-  const real* geom_data = THTensor_(data)(geom);
-
-  int32_t k, j, i;
-  // Now accumulate velocity into geometry cells so that the face velocity
-  //components are zero.
-#pragma omp parallel for private(k,j,i) collapse(3)
-  for (k = 0; k < zdim; k++) {  
-    for (j = 0; j < ydim; j++) { 
-      for (i = 0; i < xdim; i++) {
-        if (IsBlockedCell(geom_data, i, j, k, dims)) {
-          // Ignore fluid cells.
-
-          // Otherwise this is a geometry cell. Zero the velocity component then
-          // accumulate adjacent fluid cell velocities so that the boundary
-          // velocity is zero.
-          ux_data[IX(i, j, k, dims)] = 0;
-          uy_data[IX(i, j, k, dims)] = 0;
-          if (!two_dim) {
-            uz_data[IX(i, j, k, dims)] = 0;
-          }
-  
-          // Spread adjacent fluid velocities so that the face velocity values
-          // are zero along the normal of the face.
-  
-          // Look -x..
-          if (i > 0 && !IsBlockedCell(geom_data, i - 1, j, k, dims)) {
-            ux_data[IX(i, j, k, dims)] -= ux_data[IX(i - 1, j, k, dims)];
-          }
-          // Look +x.
-          if (i < (xdim - 1) && !IsBlockedCell(geom_data, i + 1, j, k, dims)) {
-            ux_data[IX(i, j, k, dims)] -= ux_data[IX(i + 1, j, k, dims)];
-          }
-          // Look -y..
-          if (j > 0 && !IsBlockedCell(geom_data, i, j - 1, k, dims)) {
-            uy_data[IX(i, j, k, dims)] -= uy_data[IX(i, j - 1, k, dims)];
-          }
-          // Look +y.
-          if (j < (ydim - 1) && !IsBlockedCell(geom_data, i, j + 1, k, dims)) {
-            uy_data[IX(i, j, k, dims)] -= uy_data[IX(i, j + 1, k, dims)];
-          }
-          if (!two_dim) {
-            // Look -z..
-            if (k > 0 && !IsBlockedCell(geom_data, i, j, k - 1, dims)) {
-              uz_data[IX(i, j, k, dims)] -= uz_data[IX(i, j, k - 1, dims)];
-            }
-            // Look +z.
-            if (k < (zdim - 1) &&
-                !IsBlockedCell(geom_data, i, j, k + 1, dims)) {
-              uz_data[IX(i, j, k, dims)] -= uz_data[IX(i, j, k + 1, dims)];
-            }
-          }
-        }
-      }
-    }
-  }
-  return 0;
-}
-
-// Expose the getInterpValue to the call to the lua stack for debugging.
+// Expose the getScalarInterpValue to the call to the lua stack for debugging.
 static int tfluids_(Main_interpField)(lua_State *L) {
   THTensor* field =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 1, torch_Tensor));
@@ -1273,14 +343,17 @@ static int tfluids_(Main_interpField)(lua_State *L) {
   interp_pos.y = pos_data[1];
   interp_pos.z = pos_data[2];
 
-  const real ret_val = tfluids_(Main_GetInterpValue)(
+  const real ret_val = tfluids_(Main_GetScalarInterpValue)(
     field_data, geom_data, interp_pos, dims, sample_into_geom);
 
   lua_pushnumber(L, static_cast<double>(ret_val));
   return 1;
 }
 
+*/
+
 static int tfluids_(Main_drawVelocityField)(lua_State *L) {
+/*
 #ifdef BUILD_GL_FUNCS
   THTensor* u =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 1, torch_Tensor));
@@ -1348,6 +421,9 @@ static int tfluids_(Main_drawVelocityField)(lua_State *L) {
   luaL_error(L, "tfluids compiled without preprocessor def BUILD_GL_FUNCS.");
 #endif
   return 0;
+  */
+  std::cout << "Error: need to sample center of MAC grid." << std::endl;
+  exit(-1);
 }
 
 static int tfluids_(Main_loadTensorTexture)(lua_State *L) {
@@ -1430,112 +506,20 @@ static int tfluids_(Main_loadTensorTexture)(lua_State *L) {
   return 0;
 }
 
-static inline void tfluids_(Main_calcVelocityUpdateAlongDim)(
-    real* delta_u, const real* p, const real* geom, const int32_t* pos,
-    const int32_t* size, const int32_t dim, const bool match_manta) {
-  const int32_t uslice = dim * size[0] * size[1] * size[2];
-
-  // This is ugly, but make an Int3 dims container for our IX and IsBlockedCell
-  // calls.
-  Int3 dims;
-  dims.x = size[0];
-  dims.y = size[1];
-  dims.z = size[2];
-
-  if (IsBlockedCell(geom, pos[0], pos[1], pos[2], dims)) {
-    delta_u[uslice + IX(pos[0], pos[1], pos[2], dims)] = 0;
-    return;
-  }
-
-  int32_t pos_p[3] = {pos[0], pos[1], pos[2]};
-  pos_p[dim] += 1;   
-  int32_t pos_n[3] = {pos[0], pos[1], pos[2]};
-  pos_n[dim] -= 1;
-
-  // First annoying special case that happens on the border because of our
-  // conversion to central velocities and because manta does not handle this
-  // case properly.
-  if (pos[dim] == 0 && match_manta) {
-    if (IsBlockedCell(geom, pos_p[0], pos_p[1], pos_p[2], dims) &&
-        !IsBlockedCell(geom, pos[0], pos[1], pos[2], dims)) {
-      delta_u[uslice + IX(pos[0], pos[1], pos[2], dims)] =
-          p[IX(pos[0], pos[1], pos[2], dims)] * static_cast<real>(0.5);
-    } else {
-      delta_u[uslice + IX(pos[0], pos[1], pos[2], dims)] =
-          p[IX(pos_p[0], pos_p[1], pos_p[2], dims)] * static_cast<real>(0.5);
-    }
-    return;
-  }
-
-  // This function will perform the conditional partial derivative to calculate
-  // the velocity update along a particular dimension.
-
-  // Look at the neighbor to the right (pos) and to the left (neg).
-  bool geomPos = false;
-  bool geomNeg = false;
-  if (pos[dim] == 0) {
-    geomNeg = true;  // Treat going off the fluid as geometry.
-  }
-  if (pos[dim] == size[dim] - 1) {
-    geomPos = true;  // Treat going off the fluid as geometry. 
-  }
-  if (pos[dim] > 0) {
-    geomNeg = IsBlockedCell(geom, pos_n[0], pos_n[1], pos_n[2], dims);
-  }
-  if (pos[dim] < size[dim] - 1) {
-    geomPos = IsBlockedCell(geom, pos_p[0], pos_p[1], pos_p[2], dims); 
-  }
-
-  // NOTE: The 0.5 below needs some explanation. We are exactly
-  // mimicking CorrectVelocity() from
-  // manta/source/pluging/pressure.cpp. In this function, all
-  // updates are single sided, but they are done to the MAC cell
-  // edges. When we convert to centered velocities, we therefore add
-  // a * 0.5 term because we take the average.
-  const real single_sided_gain = match_manta ? static_cast<real>(0.5) :
-      static_cast<real>(1);
-
-  if (geomPos and geomNeg) {
-    // There are 3 cases:
-    // A) Cell is on the left border and has a right geom neighbor.
-    // B) Cell is on the right border and has a left geom neighbor.
-    // C) Cell has a right AND left geom neighbor.
-    // In any of these cases the velocity should not receive a
-    // pressure gradient (nowhere for the pressure to diffuse.
-    delta_u[uslice + IX(pos[0], pos[1], pos[2], dims)] = 0;
-  } else if (geomPos) {
-    // There are 2 cases:
-    // A) Cell is on the right border and there's fluid to the left.
-    // B) Cell is internal but there is geom to the right.
-    // In this case we need to do a single sided diff to the left.
-    delta_u[uslice + IX(pos[0], pos[1], pos[2], dims)] =
-        (p[IX(pos[0], pos[1], pos[2], dims)] -
-         p[IX(pos_n[0], pos_n[1], pos_n[2], dims)]) * single_sided_gain;
-  } else if (geomNeg) {
-    // There are 2 cases:
-    // A) Cell is on the left border and there's fluid to the right.
-    // B) Cell is internal but there is geom to the left.
-    // In this case we need to do a single sided diff to the right.
-    delta_u[uslice + IX(pos[0], pos[1], pos[2], dims)] =
-        (p[IX(pos_p[0], pos_p[1], pos_p[2], dims)] -
-         p[IX(pos[0], pos[1], pos[2], dims)]) * single_sided_gain;
-  } else {
-    // The pixel is internal (not on border) with no geom neighbours.
-    // Do a central diff.
-    delta_u[uslice + IX(pos[0], pos[1], pos[2], dims)] =
-        (p[IX(pos_p[0], pos_p[1], pos_p[2], dims)] -
-         p[IX(pos_n[0], pos_n[1], pos_n[2], dims)]) * static_cast<real>(0.5);
-  }
-}
-
+/*
 static int tfluids_(Main_calcVelocityUpdate)(lua_State *L) {
-  THTensor* delta_u =
+  THTensor* u =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 1, torch_Tensor));
-  THTensor* p =
+  THTensor* u_div =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 2, torch_Tensor));
-  THTensor* geom =
+  THTensor* p =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 3, torch_Tensor));
-  const bool match_manta = static_cast<bool>(lua_toboolean(L, 4));
+  THTensor* geom =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 4, torch_Tensor));
+
+
+  // TODO(tompson): Finish this.
+  #error finish calcVelocityUpdate
 
   // Just do a basic dim assert, everything else goes in the lua code.
   if (delta_u->nDimension != 5 || p->nDimension != 4 || geom->nDimension != 4) {
@@ -1565,7 +549,7 @@ static int tfluids_(Main_calcVelocityUpdate)(lua_State *L) {
             const int32_t size[3] = {xdim, ydim, zdim};
 
             tfluids_(Main_calcVelocityUpdateAlongDim)(
-                cur_delta_u, cur_p, cur_geom, pos, size, c, match_manta);
+                cur_delta_u, cur_p, cur_geom, pos, size, c);
           }
         }
       }
@@ -1574,99 +558,25 @@ static int tfluids_(Main_calcVelocityUpdate)(lua_State *L) {
   return 0;
 }
 
-static inline void tfluids_(Main_calcVelocityUpdateAlongDimBackward)(
-    real* grad_p, const real* p, const real* geom, const real* grad_output, 
-    const int32_t* pos, const int32_t* size, const int32_t dim,
-    const bool match_manta) {
-  const int32_t uslice = dim * size[0] * size[1] * size[2];
-
-  Int3 dims;
-  dims.x = size[0];
-  dims.y = size[1];
-  dims.z = size[2];
-
-  if (IsBlockedCell(geom, pos[0], pos[1], pos[2], dims)) {
-    // No gradient contribution from blocked cells (since U(blocked) == 0).
-    return;
-  }
-
-  int32_t pos_p[3] = {pos[0], pos[1], pos[2]};
-  pos_p[dim] += 1;   
-  int32_t pos_n[3] = {pos[0], pos[1], pos[2]};
-  pos_n[dim] -= 1;
-
-  if (pos[dim] == 0 && match_manta) {
-    if (IsBlockedCell(geom, pos_p[0], pos_p[1], pos_p[2], dims) &&
-        !IsBlockedCell(geom, pos[0], pos[1], pos[2], dims)) {
-#pragma omp atomic
-      grad_p[IX(pos[0], pos[1], pos[2], dims)] += static_cast<real>(0.5) * 
-          grad_output[uslice + IX(pos[0], pos[1], pos[2], dims)];
-    } else {
-#pragma omp atomic
-      grad_p[IX(pos_p[0], pos_p[1], pos_p[2], dims)] += static_cast<real>(0.5) *
-          grad_output[uslice + IX(pos[0], pos[1], pos[2], dims)];
-    }
-    return;
-  }
-
-  bool geomPos = false;
-  bool geomNeg = false;
-  if (pos[dim] == 0) {
-    geomNeg = true;
-  }
-  if (pos[dim] == size[dim] - 1) {
-    geomPos = true;
-  }
-  if (pos[dim] > 0) {
-    geomNeg = IsBlockedCell(geom, pos_n[0], pos_n[1], pos_n[2], dims);
-  }
-  if (pos[dim] < size[dim] - 1) {
-    geomPos = IsBlockedCell(geom, pos_p[0], pos_p[1], pos_p[2], dims); 
-  }
-
-  const real single_sided_gain = match_manta ? static_cast<real>(0.5) :
-      static_cast<real>(1);
-
-  if (geomPos and geomNeg) {
-    // Output velocity update is zero.
-    // --> No gradient contribution from this case (since delta_u == 0).
-  } else if (geomPos) {
-    // Single sided diff to the left --> Spread the gradient contribution.
-#pragma omp atomic
-    grad_p[IX(pos[0], pos[1], pos[2], dims)] += single_sided_gain *
-        grad_output[uslice + IX(pos[0], pos[1], pos[2], dims)];
-#pragma omp atomic
-    grad_p[IX(pos_n[0], pos_n[1], pos_n[2], dims)] -= single_sided_gain *
-        grad_output[uslice + IX(pos[0], pos[1], pos[2], dims)];
-  } else if (geomNeg) {
-    // Single sided diff to the right --> Spread the gradient contribution.
-#pragma omp atomic
-    grad_p[IX(pos_p[0], pos_p[1], pos_p[2], dims)] += single_sided_gain *
-        grad_output[uslice + IX(pos[0], pos[1], pos[2], dims)];
-#pragma omp atomic
-    grad_p[IX(pos[0], pos[1], pos[2], dims)] -= single_sided_gain *
-        grad_output[uslice + IX(pos[0], pos[1], pos[2], dims)];
-  } else {
-    // Central diff --> Spread the gradient contribution.
-#pragma omp atomic
-    grad_p[IX(pos_p[0], pos_p[1], pos_p[2], dims)] += (static_cast<real>(0.5) *
-        grad_output[uslice + IX(pos[0], pos[1], pos[2], dims)]);
-#pragma omp atomic
-    grad_p[IX(pos_n[0], pos_n[1], pos_n[2], dims)] -= (static_cast<real>(0.5) *
-        grad_output[uslice + IX(pos[0], pos[1], pos[2], dims)]);
-  }
-}
-
 static int tfluids_(Main_calcVelocityUpdateBackward)(lua_State *L) {
   THTensor* grad_p =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 1, torch_Tensor));
+  THTensor* u =
+        reinterpret_cast<THTensor*>(luaT_checkudata(L, 2, torch_Tensor));
+  THTensor* u_div =
+        reinterpret_cast<THTensor*>(luaT_checkudata(L, 3, torch_Tensor));
   THTensor* p =
-      reinterpret_cast<THTensor*>(luaT_checkudata(L, 2, torch_Tensor));
-  THTensor* geom =
-      reinterpret_cast<THTensor*>(luaT_checkudata(L, 3, torch_Tensor));
-  THTensor* grad_output =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 4, torch_Tensor));
-  const bool match_manta = static_cast<bool>(lua_toboolean(L, 5));
+  THTensor* geom =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 5, torch_Tensor));
+  THTensor* grad_output =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 6, torch_Tensor));
+
+
+
+  // TODO(tompson): Finish this.
+  #error finish calcVelocityUpdateBackward
+
 
   // Just do a basic dim assert, everything else goes in the lua code.
   if (grad_output->nDimension != 5 || p->nDimension != 4 ||
@@ -1708,86 +618,13 @@ static int tfluids_(Main_calcVelocityUpdateBackward)(lua_State *L) {
             const int32_t size[3] = {xdim, ydim, zdim};
 
             tfluids_(Main_calcVelocityUpdateAlongDimBackward)(
-                cur_grad_p, cur_p, cur_geom, cur_grad_output, pos, size, c,
-                match_manta);
+                cur_grad_p, cur_p, cur_geom, cur_grad_output, pos, size, c);
           }
         }
       }
     }
   }
   return 0;
-}
-
-static inline void tfluids_(Main_calcVelocityDivergenceCell)(
-    const real* u, const real* geom, real* u_div, const int32_t* pos,
-    const int32_t* size, const int32_t nuchan) {
-  Int3 dims;
-  dims.x = size[0];
-  dims.y = size[1];
-  dims.z = size[2];
-
-  // Zero the output divergence.
-  u_div[IX(pos[0], pos[1], pos[2], dims)] = 0;
-
-  if (IsBlockedCell(geom, pos[0], pos[1], pos[2], dims)) {
-    // Divergence INSIDE geometry is zero always, or we don't try to minimize it
-    // during training.
-    return;
-  }
- 
-  // Now calculate the partial derivatives in each dimension.
-  for (int32_t dim = 0; dim < nuchan; dim ++) {
-    const int32_t uslice = dim * size[0] * size[1] * size[2];
-
-    int32_t pos_p[3] = {pos[0], pos[1], pos[2]};
-    pos_p[dim] += 1;   
-    int32_t pos_n[3] = {pos[0], pos[1], pos[2]};
-    pos_n[dim] -= 1;
-
-    // Look at the neighbor to the right (pos) and to the left (neg).
-    bool geomPos = false;
-    bool geomNeg = false;
-    if (pos[dim] == 0) {
-      geomNeg = true;  // Treat going off the fluid as geometry.
-    }
-    if (pos[dim] == size[dim] - 1) {
-      geomPos = true;  // Treat going off the fluid as geometry. 
-    }
-    if (pos[dim] > 0) {
-      geomNeg = IsBlockedCell(geom, pos_n[0], pos_n[1], pos_n[2], dims);
-    }
-    if (pos[dim] < size[dim] - 1) {
-      geomPos = IsBlockedCell(geom, pos_p[0], pos_p[1], pos_p[2], dims); 
-    }
-
-    if (geomPos and geomNeg) {
-      // We are bordered by two geometry voxels OR one voxel and the border.
-      // Treat the current partial derivative w.r.t. dim as 0.
-      continue;
-    } else if (geomPos) {
-      // There are 2 cases:
-      // A) Cell is on the right border and there's fluid to the left.
-      // B) Cell is internal but there is geom to the right.
-      // In this case we need to do a single sided diff to the left.
-      u_div[IX(pos[0], pos[1], pos[2], dims)] +=
-          (u[uslice + IX(pos[0], pos[1], pos[2], dims)] -
-           u[uslice + IX(pos_n[0], pos_n[1], pos_n[2], dims)]);
-    } else if (geomNeg) {
-      // There are 2 cases:
-      // A) Cell is on the left border and there's fluid to the right.
-      // B) Cell is internal but there is geom to the left.
-      // In this case we need to do a single sided diff to the right.
-      u_div[IX(pos[0], pos[1], pos[2], dims)] +=
-          (u[uslice + IX(pos_p[0], pos_p[1], pos_p[2], dims)] -
-           u[uslice + IX(pos[0], pos[1], pos[2], dims)]);
-    } else {
-      // The pixel is internal (not on border) with no geom neighbours.
-      // Do a central diff.
-      u_div[IX(pos[0], pos[1], pos[2], dims)] += static_cast<real>(0.5) *
-          (u[uslice + IX(pos_p[0], pos_p[1], pos_p[2], dims)] -
-           u[uslice + IX(pos_n[0], pos_n[1], pos_n[2], dims)]);
-    }
-  }
 }
 
 static int tfluids_(Main_calcVelocityDivergence)(lua_State *L) {
@@ -1831,71 +668,6 @@ static int tfluids_(Main_calcVelocityDivergence)(lua_State *L) {
     }
   }
   return 0;
-}
-
-static inline void tfluids_(Main_calcVelocityDivergenceCellBackward)(
-    const real* u, const real* geom, real* grad_u, const real* grad_output,
-    const int32_t* pos, const int32_t* size, const int32_t nuchan) {
-  Int3 dims;
-  dims.x = size[0];
-  dims.y = size[1];
-  dims.z = size[2];
-  
-  if (IsBlockedCell(geom, pos[0], pos[1], pos[2], dims)) {
-    // geometry cells do not contribute any gradient (since UDiv(geometry) = 0).
-    return;
-  }
-  
-  // Now calculate the partial derivatives in each dimension.
-  for (int32_t dim = 0; dim < nuchan; dim ++) {
-    const int32_t uslice = dim * size[0] * size[1] * size[2];
-
-    int32_t pos_p[3] = {pos[0], pos[1], pos[2]};
-    pos_p[dim] += 1;   
-    int32_t pos_n[3] = {pos[0], pos[1], pos[2]};
-    pos_n[dim] -= 1;
-
-    // Look at the neighbor to the right (pos) and to the left (neg).
-    bool geomPos = false;
-    bool geomNeg = false;
-    if (pos[dim] == 0) {
-      geomNeg = true;  // Treat going off the fluid as geometry.
-    }
-    if (pos[dim] == size[dim] - 1) {
-      geomPos = true;  // Treat going off the fluid as geometry. 
-    }
-    if (pos[dim] > 0) {
-      geomNeg = IsBlockedCell(geom, pos_n[0], pos_n[1], pos_n[2], dims);
-    }
-    if (pos[dim] < size[dim] - 1) { 
-      geomPos = IsBlockedCell(geom, pos_p[0], pos_p[1], pos_p[2], dims);
-    }
-
-    if (geomPos and geomNeg) {
-      continue;
-    } else if (geomPos) {
-#pragma omp atomic
-      grad_u[uslice + IX(pos[0], pos[1], pos[2], dims)] +=
-        grad_output[IX(pos[0], pos[1], pos[2], dims)];
-#pragma omp atomic
-      grad_u[uslice + IX(pos_n[0], pos_n[1], pos_n[2], dims)] -=
-        grad_output[IX(pos[0], pos[1], pos[2], dims)];
-    } else if (geomNeg) {
-#pragma omp atomic
-      grad_u[uslice + IX(pos_p[0], pos_p[1], pos_p[2], dims)] +=
-        grad_output[IX(pos[0], pos[1], pos[2], dims)];
-#pragma omp atomic
-      grad_u[uslice + IX(pos[0], pos[1], pos[2], dims)] -=
-        grad_output[IX(pos[0], pos[1], pos[2], dims)];
-    } else {
-#pragma omp atomic
-      grad_u[uslice + IX(pos_p[0], pos_p[1], pos_p[2], dims)] +=
-        grad_output[IX(pos[0], pos[1], pos[2], dims)] * static_cast<real>(0.5);
-#pragma omp atomic
-      grad_u[uslice + IX(pos_n[0], pos_n[1], pos_n[2], dims)] -=
-        grad_output[IX(pos[0], pos[1], pos[2], dims)] * static_cast<real>(0.5);
-    }
-  }
 }
 
 static int tfluids_(Main_calcVelocityDivergenceBackward)(lua_State *L) {
@@ -1951,6 +723,130 @@ static int tfluids_(Main_calcVelocityDivergenceBackward)(lua_State *L) {
   return 0;
 }
 
+*/
+
+static int tfluids_(Main_volumetricUpSamplingNearestForward)(lua_State *L) {
+  const int32_t ratio = static_cast<int32_t>(lua_tointeger(L, 1));
+  THTensor* input =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 2, torch_Tensor));
+  THTensor* output =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 3, torch_Tensor));
+
+  if (input->nDimension != 5 || output->nDimension != 5) {
+    luaL_error(L, "ERROR: input and output must be dim 5");
+  }
+
+  const int32_t nbatch = input->size[0];
+  const int32_t nfeat = input->size[1];
+  const int32_t zdim = input->size[2];
+  const int32_t ydim = input->size[3];
+  const int32_t xdim = input->size[4];
+
+  if (output->size[0] != nbatch || output->size[1] != nfeat ||
+      output->size[2] != zdim * ratio || output->size[3] != ydim * ratio ||
+      output->size[4] != xdim * ratio) {
+    luaL_error(L, "ERROR: input : output size mismatch.");
+  }
+
+  const real* input_data = THTensor_(data)(input);
+  real* output_data = THTensor_(data)(output);
+
+  int32_t b, f, z, y, x;
+#pragma omp parallel for private(b, f, z, y, x) collapse(5)
+  for (b = 0; b < nbatch; b++) {
+    for (f = 0; f < nfeat; f++) {
+      for (z = 0; z < zdim * ratio; z++) {
+        for (y = 0; y < ydim * ratio; y++) {
+          for (x = 0; x < xdim * ratio; x++) {
+            const int64_t iout = output->stride[0] * b + output->stride[1] * f +
+                output->stride[2] * z +
+                output->stride[3] * y + 
+                output->stride[4] * x;
+            const int64_t iin = input->stride[0] * b + input->stride[1] * f +
+                input->stride[2] * (z / ratio) +
+                input->stride[3] * (y / ratio) +
+                input->stride[4] * (x / ratio);
+            output_data[iout] = input_data[iin];
+          }
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+static int tfluids_(Main_volumetricUpSamplingNearestBackward)(lua_State *L) {
+  const int32_t ratio = static_cast<int32_t>(lua_tointeger(L, 1));
+  THTensor* input =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 2, torch_Tensor));
+  THTensor* grad_output =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 3, torch_Tensor));
+  THTensor* grad_input =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 4, torch_Tensor));
+
+  if (input->nDimension != 5 || grad_output->nDimension != 5 ||
+      grad_input->nDimension != 5) {
+    luaL_error(L, "ERROR: input, gradOutput and gradInput must be dim 5");
+  }
+
+  const int32_t nbatch = input->size[0];
+  const int32_t nfeat = input->size[1];
+  const int32_t zdim = input->size[2];
+  const int32_t ydim = input->size[3];
+  const int32_t xdim = input->size[4];
+
+  if (grad_output->size[0] != nbatch || grad_output->size[1] != nfeat ||
+      grad_output->size[2] != zdim * ratio ||
+      grad_output->size[3] != ydim * ratio ||
+      grad_output->size[4] != xdim * ratio) {
+    luaL_error(L, "ERROR: input : gradOutput size mismatch.");
+  }
+
+  if (grad_input->size[0] != nbatch || grad_input->size[1] != nfeat ||
+      grad_input->size[2] != zdim || grad_input->size[3] != ydim ||
+      grad_input->size[4] != xdim) {
+    luaL_error(L, "ERROR: input : gradInput size mismatch.");
+  }
+
+  const real* input_data = THTensor_(data)(input);
+  const real* grad_output_data = THTensor_(data)(grad_output);
+  real * grad_input_data = THTensor_(data)(grad_input);
+
+  int32_t b, f, z, y, x;
+#pragma omp parallel for private(b, f, z, y, x) collapse(5)
+  for (b = 0; b < nbatch; b++) {
+    for (f = 0; f < nfeat; f++) {
+      for (z = 0; z < zdim; z++) {
+        for (y = 0; y < ydim; y++) {
+          for (x = 0; x < xdim; x++) {
+            const int64_t iout = grad_input->stride[0] * b +
+                grad_input->stride[1] * f +
+                grad_input->stride[2] * z +
+                grad_input->stride[3] * y +
+                grad_input->stride[4] * x;
+            float sum = static_cast<real>(0);
+            // Now accumulate gradients from the upsampling window.
+            for (int32_t zup = 0; zup < ratio; zup++) {
+              for (int32_t yup = 0; yup < ratio; yup++) {
+                for (int32_t xup = 0; xup < ratio; xup++) {
+                  const int64_t iin = grad_output->stride[0] * b +
+                      grad_output->stride[1] * f +
+                      grad_output->stride[2] * (z * ratio + zup) +
+                      grad_output->stride[3] * (y * ratio + yup) +
+                      grad_output->stride[4] * (x * ratio + xup);
+                  sum += grad_output_data[iin];
+                }
+              }
+            }
+            grad_input_data[iout] = sum;
+          }
+        }
+      }
+    }
+  }
+  return 0;
+}
+
 static int tfluids_(Main_solveLinearSystemPCG)(lua_State *L) {
   luaL_error(L, "ERROR: solveLinearSystemPCG not defined for CPU tensors.");
   return 0;
@@ -1958,19 +854,21 @@ static int tfluids_(Main_solveLinearSystemPCG)(lua_State *L) {
 
 static const struct luaL_Reg tfluids_(Main__) [] = {
   {"advectScalar", tfluids_(Main_advectScalar)},
-  {"advectVel", tfluids_(Main_advectVel)}, 
-  {"vorticityConfinement", tfluids_(Main_vorticityConfinement)},
-  {"averageBorderCells", tfluids_(Main_averageBorderCells)},
-  {"setObstacleBcs", tfluids_(Main_setObstacleBcs)},
-  {"interpField", tfluids_(Main_interpField)},
+//  {"advectVel", tfluids_(Main_advectVel)}, 
+//  {"vorticityConfinement", tfluids_(Main_vorticityConfinement)},
+//  {"interpField", tfluids_(Main_interpField)},
   {"drawVelocityField", tfluids_(Main_drawVelocityField)},
   {"loadTensorTexture", tfluids_(Main_loadTensorTexture)},
-  {"calcVelocityUpdate", tfluids_(Main_calcVelocityUpdate)},
-  {"calcVelocityUpdateBackward", tfluids_(Main_calcVelocityUpdateBackward)},
-  {"calcVelocityDivergence", tfluids_(Main_calcVelocityDivergence)},
-  {"calcVelocityDivergenceBackward",
-   tfluids_(Main_calcVelocityDivergenceBackward)},
+//  {"calcVelocityUpdate", tfluids_(Main_calcVelocityUpdate)},
+//  {"calcVelocityUpdateBackward", tfluids_(Main_calcVelocityUpdateBackward)},
+//  {"calcVelocityDivergence", tfluids_(Main_calcVelocityDivergence)},
+//  {"calcVelocityDivergenceBackward",
+//   tfluids_(Main_calcVelocityDivergenceBackward)},
   {"solveLinearSystemPCG", tfluids_(Main_solveLinearSystemPCG)},
+  {"volumetricUpSamplingNearestForward",
+   tfluids_(Main_volumetricUpSamplingNearestForward)},
+  {"volumetricUpSamplingNearestBackward",
+   tfluids_(Main_volumetricUpSamplingNearestBackward)},
   {NULL, NULL}  // NOLINT
 };
 

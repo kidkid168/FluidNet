@@ -39,6 +39,7 @@ function tfluids.removeBCs(batch)
   batch.UBCInvMask = nil
   batch.densityBC = nil
   batch.densityBCInvMask = nil
+  collectgarbage()
 end
 
 -- @param densityVal: table of scalar values of size density:size(2) (i.e. the
@@ -107,55 +108,10 @@ function tfluids.createPlumeBCs(batch, densityVal, uScale, rad)
   end
 end
 
-local function setBoundaryConditionsAverage(p, U, geom, density)
-  -- This is NOT physically plausible, but helps with divergence blowup on
-  -- the boundaries. The boundaries will all receive the local average.
-  tfluids._UAve = tfluids._UAve or torch.Tensor():typeAs(U)
-  tfluids._UAve:resizeAs(U):copy(U)
-  tfluids.averageBorderCells(U, geom, tfluids._UAve)
-  -- Copy the results back.
-  U:copy(tfluids._UAve)
-end
-
-local function setBoundaryConditionsZero(p, U, geom, density)
-  assert(U:dim() == 4)
-  local twoDim = U:size(1) == 2
-  -- TODO(kris): Only zero velocities exiting boundaries.
-  if not twoDim then
-    U[{{}, {1}, {}, {}}]:zero()
-    U[{{}, {-1}, {}, {}}]:zero()
-  end
-  U[{{}, {}, {1}, {}}]:zero()
-  U[{{}, {}, {-1}, {}}]:zero()
-  U[{{}, {}, {}, {1}}]:zero()
-  U[{{}, {}, {}, {-1}}]:zero()
-end
-
-local function setBoundaryConditionsBatch(batch, bndType)
-  if bndType == 'None' then
-    return
-  end
-  local p, U, geom, density = tfluids.getPUGeomDensityReference(batch)
-
-  for b = 1, U:size(1) do
-    local curP = p[b]
-    local curU = U[b]
-    local curGeom = geom[b]
-    local curDensity
-    if density ~= nil then
-      curDensity = density[b]
-    end
-    bndType = bndType or 'Zero'
-    if bndType == 'Zero' then
-      setBoundaryConditionsZero(curP, curU, curGeom, curDensity)
-    elseif bndType == 'Ave' then
-      setBoundaryConditionsAverage(curP, curU, curGeom, curDensity)
-    else
-      error('Bad bndType value: ' .. bndType)
-    end
-    tfluids.setObstacleBcs(curU, curGeom)
-  end
-
+-- We have some somewhat hacky boundary conditions, where we freeze certain
+-- values on every iteration of the solver. It is equivalent to setting internal
+-- fluid cells to not receive updates during the pressure projection.
+local function setBoundaryConditionsBatch(p, U, geom, density)
   -- Apply the external BCs.
   -- TODO(tompson): We have a separate "mask" tensor for every boundary
   -- condition type. These should really be an bit enum to specify which
@@ -299,21 +255,21 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
 
   -- Now self-advect velocity (must be advected last).
   advectVelocityBatch(mconf.dt, U, geom, mconf.advectionMethod)
-  setBoundaryConditionsBatch(batch, mconf.bndType)
+
+  -- Set the manual boundary conditions.
+  setBoundaryConditionsBatch(p, U, geom, density)
 
   -- Add external forces (buoyancy and gravity).
   if density ~= nil and mconf.buoyancyScale > 0 then
     tfluids.buoyancyBatch(mconf.dt, density, U, geom, mconf.buoyancyScale)
-    setBoundaryConditionsBatch(batch, mconf.bndType)
   end
 
-  -- TODO(tompson,kris): Add support for gravity (easy to do, just add (-dt) * g
-  -- to the velocity field y component).
+  -- TODO(tompson,kris): Add support for gravity (easy to do, just add (-dt)
+  -- * g to the velocity field y component).
 
   -- Add vorticity confinement.
   if mconf.vorticityConfinementAmp > 0 then
     vorticityConfinementBatch(mconf.dt, mconf.vorticityConfinementAmp, U, geom)
-    setBoundaryConditionsBatch(batch, mconf.bndType)
   end
 
   if outputDiv then
@@ -321,6 +277,8 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
     -- divergent velocity and pressure.
     return
   end
+
+  setBoundaryConditionsBatch(p, U, geom, density)
 
   -- FPROP the model to perform the pressure projection & velocity calculation.
   local modelOutput = model:forward(torch.getModelInput(batch))
@@ -330,7 +288,8 @@ function tfluids.simulate(conf, mconf, batch, model, outputDiv)
   p:copy(pPred)
   U:copy(UPred)
 
-  setBoundaryConditionsBatch(batch, mconf.bndType)
+  -- Again, make sure the boundary conditions we set are maintained.
+  setBoundaryConditionsBatch(p, U, geom, density)
 
   -- Finally, clamp the velocity so that even if the sim blows up it wont blow
   -- up to inf (which causes some of our kernels to hang infinitely).

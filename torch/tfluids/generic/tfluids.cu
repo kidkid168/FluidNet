@@ -24,7 +24,6 @@
 #include "THCDeviceTensorUtils.cuh"
 #include "THCDeviceUtils.cuh"
 #include "THCReduceApplyUtils.cuh"
-#include "quadrants.h"  // typedef enum Quadrants
 
 // This is REALLY ugly. But unfortunately cutorch_getstate() in
 // cutorch/torch/util.h is not exposed externally. We could call
@@ -51,6 +50,8 @@ static void init_cusparse() {
     }
   }
 }
+
+/*
 
 //******************************************************************************
 // HELPER METHODS
@@ -144,106 +145,11 @@ __device__ __forceinline__ float length3(const float v[3]) {
 }
 
 //******************************************************************************
-// averageBorderCells
-//******************************************************************************
-
-// averageBorderCells CUDA kernel
-__global__ void kernel_averageBorderCells(
-    THCDeviceTensor<float, 4> in, THCDeviceTensor<float, 3> geom,
-    THCDeviceTensor<float, 4> out, const int nchan, const int zdim,
-    const int ydim, const int xdim, const bool two_dim) {
-  const int pnt_id = threadIdx.x + blockIdx.x * blockDim.x;
-  const int z = blockIdx.y;
-  const int chan = blockIdx.z;
-  if (pnt_id >= (in.getSize(2) * in.getSize(3))) {
-    return;
-  }
-  const int y = pnt_id / in.getSize(3);
-  const int x = pnt_id % in.getSize(3);
-  const bool on_border = (!two_dim && (z == 0 || z == (zdim - 1))) ||
-      y == 0 || y == (ydim - 1) ||
-      x == 0 || x == (xdim - 1);
-
-  if (!on_border) {
-    // Copy the result and return.
-    // NOTE: due to weird compile issues with the THCDeviceSubTensor function,
-    // we have to set the in value to a temporary register before setting the
-    // out value (i.e. this doesn't compile out[x] = in[x]).
-    const float value = in[chan][z][y][x];
-    out[chan][z][y][x] = value;
-    return;
-  }
-
-  // We're a border pixel.
-  // TODO(tompson): This is an O(n^3) iteration to find a small
-  // sub-set of the pixels. Fix it. (same as C code).
-
-  float sum = 0;
-  int count = 0;
-  for (int zoff = z - 1; zoff <= z + 1; zoff++) {
-    for (int yoff = y - 1; yoff <= y + 1; yoff++) {
-      for (int xoff = x - 1; xoff <= x + 1; xoff++) {
-        if (zoff >= 0 && zoff < zdim && yoff >= 0 && yoff < ydim &&
-            xoff >= 0 && xoff < xdim) {
-          // The neighbor is on the image.
-          if (geom[zoff][yoff][xoff] < 1e-6f) {
-            // The neighbor is NOT geometry.
-            count++;
-            sum += in[chan][zoff][yoff][xoff];
-          }
-        }
-      }
-    }
-  }
-  if (count > 0) {
-    out[chan][z][y][x] = sum / (float)(count);
-  } else {
-    // No non-geom pixels found. Just copy over result.
-    const float value = in[chan][z][y][x];
-    out[chan][z][y][x] = value;
-  }
-}
-
-// averageBorderCells lua entry point.
-static int tfluids_CudaMain_averageBorderCells(lua_State *L) {
-  THCState* state = cutorch_getstate(L);
-
-  THCudaTensor* in = reinterpret_cast<THCudaTensor*>(
-      luaT_checkudata(L, 1, "torch.CudaTensor"));
-  THCudaTensor* geom = reinterpret_cast<THCudaTensor*>(
-      luaT_checkudata(L, 2, "torch.CudaTensor"));
-  THCudaTensor* out = reinterpret_cast<THCudaTensor*>(
-      luaT_checkudata(L, 3, "torch.CudaTensor"));
-  if (in->nDimension != 4 || geom->nDimension != 3) {
-    luaL_error(L, "Input tensor should be 4D and geom should be 3D");
-  }
-  const int nchan = in->size[0];
-  const int zdim = in->size[1];
-  const int ydim = in->size[2];
-  const int xdim = in->size[3];
-  const bool two_dim = zdim == 1;
-
-  THCDeviceTensor<float, 4> dev_in = toDeviceTensor<float, 4>(state, in);
-  THCDeviceTensor<float, 3> dev_geom = toDeviceTensor<float, 3>(state, geom);
-  THCDeviceTensor<float, 4> dev_out = toDeviceTensor<float, 4>(state, out);
-
-  int nplane = dev_in.getSize(2) * dev_in.getSize(3);
-  dim3 grid_size(THCCeilDiv(nplane, 256), dev_in.getSize(1), dev_in.getSize(0));
-  dim3 block_size(nplane > 256 ? 256 : nplane);
-
-  kernel_averageBorderCells<<<grid_size, block_size, 0,
-                              THCState_getCurrentStream(state)>>>(
-      dev_in, dev_geom, dev_out, nchan, zdim, ydim, xdim, two_dim);
-
-  return 0;
-}
-
-//******************************************************************************
 // setObstacleBCS
 //******************************************************************************
 
-// setObstacleBcs CUDA kernel
-__global__ void kernel_setObstacleBcs(
+// setGeomVelForAdvection CUDA kernel
+__global__ void kernel_setGeomVelForAdvection(
     THCDeviceTensor<float, 4> U, THCDeviceTensor<float, 3> geom,
     const int zdim, const int ydim, const int xdim, const bool two_dim) {
   const int pnt_id = threadIdx.x + blockIdx.x * blockDim.x;
@@ -299,8 +205,8 @@ __global__ void kernel_setObstacleBcs(
   }
 }
 
-// setObstacleBcs lua entry point.
-static int tfluids_CudaMain_setObstacleBcs(lua_State *L) {
+// setGeomVelForAdvection lua entry point.
+static int tfluids_CudaMain_setGeomVelForAdvection(lua_State *L) {
   THCState* state = cutorch_getstate(L);
 
   THCudaTensor* U = reinterpret_cast<THCudaTensor*>(
@@ -331,7 +237,7 @@ static int tfluids_CudaMain_setObstacleBcs(lua_State *L) {
   dim3 grid_size(THCCeilDiv(nplane, 256), dev_U.getSize(1), dev_U.getSize(0));
   dim3 block_size(nplane > 256 ? 256 : nplane);
 
-  kernel_setObstacleBcs<<<grid_size, block_size, 0,
+  kernel_setGeomVelForAdvection<<<grid_size, block_size, 0,
                           THCState_getCurrentStream(state)>>>(
       dev_U, dev_geom, zdim, ydim, xdim, two_dim);
   return 0;
@@ -673,19 +579,19 @@ __global__ void kernel_calcVelocityUpdate(
   // the velocity update along a particular dimension.
 
   // Look at the neighbor to the right (pos) and to the left (neg).
-  bool geomPos = false;
-  bool geomNeg = false;
-  if (pos[dim] == 0) {
-    geomNeg = true;  // Treat going off the fluid as geometry.
+  bool geom_pos = false;
+  bool geom_neg = false;
+  if (pos[dim] <= 0) {
+    geom_neg = true;  // Treat going off the fluid as geometry.
   }
-  if (pos[dim] == size[dim] - 1) {
-    geomPos = true;  // Treat going off the fluid as geometry. 
+  if (pos[dim] >= size[dim] - 1) {
+    geom_pos = true;  // Treat going off the fluid as geometry. 
   }
   if (pos[dim] > 0) {
-    geomNeg = geom[batch][pos_n[2]][pos_n[1]][pos_n[0]] == 1.0f;
+    geom_neg = geom[batch][pos_n[2]][pos_n[1]][pos_n[0]] == 1.0f;
   }
   if (pos[dim] < size[dim] - 1) {
-    geomPos = geom[batch][pos_p[2]][pos_p[1]][pos_p[0]] == 1.0f; 
+    geom_pos = geom[batch][pos_p[2]][pos_p[1]][pos_p[0]] == 1.0f; 
   }
 
   // NOTE: The 0.5 below needs some explanation. We are exactly
@@ -696,7 +602,7 @@ __global__ void kernel_calcVelocityUpdate(
   // a * 0.5 term because we take the average.
   const float single_sided_gain = match_manta ? 0.5f : 1.0f;
 
-  if (geomPos and geomNeg) {
+  if (geom_pos and geom_neg) {
     // There are 3 cases:
     // A) Cell is on the left border and has a right geom neighbor.
     // B) Cell is on the right border and has a left geom neighbor.
@@ -704,7 +610,7 @@ __global__ void kernel_calcVelocityUpdate(
     // In any of these cases the velocity should not receive a
     // pressure gradient (nowhere for the pressure to diffuse.
     delta_u[batch][dim][pos[2]][pos[1]][pos[0]] = 0;
-  } else if (geomPos) {
+  } else if (geom_pos) {
     // There are 2 cases:
     // A) Cell is on the right border and there's fluid to the left.
     // B) Cell is internal but there is geom to the right.
@@ -712,7 +618,7 @@ __global__ void kernel_calcVelocityUpdate(
     delta_u[batch][dim][pos[2]][pos[1]][pos[0]] = single_sided_gain *
         (p[batch][pos[2]][pos[1]][pos[0]] -
          p[batch][pos_n[2]][pos_n[1]][pos_n[0]]);
-  } else if (geomNeg) {
+  } else if (geom_neg) {
     // There are 2 cases:
     // A) Cell is on the left border and there's fluid to the right.
     // B) Cell is internal but there is geom to the left.
@@ -821,32 +727,32 @@ __global__ void kernel_calcVelocityUpdateBackward(
     return;
   }
 
-  bool geomPos = false;
-  bool geomNeg = false;
+  bool geom_pos = false;
+  bool geom_neg = false;
   if (pos[dim] == 0) {
-    geomNeg = true;
+    geom_neg = true;
   }
   if (pos[dim] == size[dim] - 1) {
-    geomPos = true;
+    geom_pos = true;
   }
   if (pos[dim] > 0) {
-    geomNeg = geom[batch][pos_n[2]][pos_n[1]][pos_n[0]] == 1.0f;
+    geom_neg = geom[batch][pos_n[2]][pos_n[1]][pos_n[0]] == 1.0f;
   }
   if (pos[dim] < size[dim] - 1) {
-    geomPos = geom[batch][pos_p[2]][pos_p[1]][pos_p[0]] == 1.0f; 
+    geom_pos = geom[batch][pos_p[2]][pos_p[1]][pos_p[0]] == 1.0f; 
   }
   
   const float single_sided_gain = match_manta ? 0.5f : 1.0f;
-  if (geomPos and geomNeg) {
+  if (geom_pos and geom_neg) {
     // Output velocity update is zero.
     // --> No gradient contribution from this case (since delta_u == 0).
-  } else if (geomPos) {
+  } else if (geom_pos) {
     // Single sided diff to the left --> Spread the gradient contribution.
     atomicAdd(&grad_p[batch][pos[2]][pos[1]][pos[0]], single_sided_gain *
         grad_output[batch][dim][pos[2]][pos[1]][pos[0]]);
     atomicAdd(&grad_p[batch][pos_n[2]][pos_n[1]][pos_n[0]], -single_sided_gain *
         grad_output[batch][dim][pos[2]][pos[1]][pos[0]]);
-  } else if (geomNeg) {
+  } else if (geom_neg) {
     // Single sided diff to the right --> Spread the gradient contribution.
     atomicAdd(&grad_p[batch][pos_p[2]][pos_p[1]][pos_p[0]], single_sided_gain *
         grad_output[batch][dim][pos[2]][pos[1]][pos[0]]);
@@ -950,44 +856,46 @@ __global__ void kernel_calcVelocityDivergence(
     pos_n[dim] -= 1;
 
     // Look at the neighbor to the right (pos) and to the left (neg).
-    bool geomPos = false;
-    bool geomNeg = false;
-    if (pos[dim] == 0) {
-      geomNeg = true;  // Treat going off the fluid as geometry.
+    bool out_of_bounds_pos = false;
+    bool out_of_bounds_neg = false;
+    if (pos[dim] <= 0) {
+      out_of_bounds_neg = true;
     }
-    if (pos[dim] == size[dim] - 1) {
-      geomPos = true;  // Treat going off the fluid as geometry. 
-    }
-    if (pos[dim] > 0) {
-      geomNeg = geom[batch][pos_n[2]][pos_n[1]][pos_n[0]] == 1.0f;
-    }
-    if (pos[dim] < size[dim] - 1) {
-      geomPos = geom[batch][pos_p[2]][pos_p[1]][pos_p[0]] == 1.0f;
+    if (pos[dim] >= size[dim] - 1) {
+      out_of_bounds_pos = true;
     }
 
-    if (geomPos and geomNeg) {
-      // We are bordered by two geometry voxels OR one voxel and the border.
-      // Treat the current partial derivative w.r.t. dim as 0.
+    if (out_of_bounds_pos and out_of_bounds_neg) {
+      // This is a degenerate case and probably wont happen. The dimension is
+      // size 1 and so we should treat the partial derivative w.r.t. dim as 0.
       continue;
-    } else if (geomPos) {
-      // There are 2 cases:
-      // A) Cell is on the right border and there's fluid to the left.
-      // B) Cell is internal but there is geom to the right.
+    } else if (out_of_bounds_pos) {
+      // Cell is on the right border.
       // In this case we need to do a single sided diff to the left.
+      // An important note here: this is equivilent to setting a border of 1
+      // in manta that has the flags outFlow and fluid. It basically means that
+      // the simulation is NOT penalized for outflow out of the simulation
+      // boundary (i.e. there is NO divergence contribution from outside the
+      // simulation domain).
       u_div[batch][pos[2]][pos[1]][pos[0]] +=
           (u[batch][dim][pos[2]][pos[1]][pos[0]] -
            u[batch][dim][pos_n[2]][pos_n[1]][pos_n[0]]);
-    } else if (geomNeg) {
-      // There are 2 cases:
-      // A) Cell is on the left border and there's fluid to the right.
-      // B) Cell is internal but there is geom to the left.
+    } else if (out_of_bounds_neg) {
+      // Cell is on the left border.
       // In this case we need to do a single sided diff to the right.
+      // Note above applies here.
       u_div[batch][pos[2]][pos[1]][pos[0]] +=
           (u[batch][dim][pos_p[2]][pos_p[1]][pos_p[0]] -
            u[batch][dim][pos[2]][pos[1]][pos[0]]);
     } else {
-      // The pixel is internal (not on border) with no geom neighbours.
+      // The pixel is internal (not on border).
       // Do a central diff.
+      // A quick note here: Our slip boundary conditions internally means that
+      // we need to ensure that the normal velocity at the geom face is zero.
+      // We COULD interpolate the velocities at the half-step (cell edge) and
+      // calculate central differences there. However, this is actually
+      // equivalent to sampling into the geometry (with velocity zero) and
+      // doing central differences with a unit step on each side.
       u_div[batch][pos[2]][pos[1]][pos[0]] += 0.5f *
           (u[batch][dim][pos_p[2]][pos_p[1]][pos_p[0]] -
            u[batch][dim][pos_n[2]][pos_n[1]][pos_n[0]]);
@@ -1068,29 +976,23 @@ __global__ void kernel_calcVelocityDivergenceBackward(
     pos_n[dim] -= 1;
 
     // Look at the neighbor to the right (pos) and to the left (neg).
-    bool geomPos = false;
-    bool geomNeg = false;
-    if (pos[dim] == 0) {
-      geomNeg = true;  // Treat going off the fluid as geometry.
+    bool out_of_bounds_pos = false;
+    bool out_of_bounds_neg = false;
+    if (pos[dim] <= 0) {
+      out_of_bounds_neg = true;
     }
-    if (pos[dim] == size[dim] - 1) {
-      geomPos = true;  // Treat going off the fluid as geometry. 
-    }
-    if (pos[dim] > 0) {
-      geomNeg = geom[batch][pos_n[2]][pos_n[1]][pos_n[0]] == 1.0f;
-    }
-    if (pos[dim] < size[dim] - 1) {
-      geomPos = geom[batch][pos_p[2]][pos_p[1]][pos_p[0]] == 1.0f;
+    if (pos[dim] >= size[dim] - 1) {
+      out_of_bounds_pos = true;
     }
 
-    if (geomPos and geomNeg) {
+    if (out_of_bounds_pos && out_of_bounds_neg) {
       continue;
-    } else if (geomPos) {
+    } else if (out_of_bounds_pos) {
       atomicAdd(&grad_u[batch][dim][pos[2]][pos[1]][pos[0]],
         grad_output[batch][pos[2]][pos[1]][pos[0]]);
       atomicAdd(&grad_u[batch][dim][pos_n[2]][pos_n[1]][pos_n[0]],
         -grad_output[batch][pos[2]][pos[1]][pos[0]]);
-    } else if (geomNeg) {
+    } else if (out_of_bounds_neg) {
       atomicAdd(&grad_u[batch][dim][pos_p[2]][pos_p[1]][pos_p[0]],
         grad_output[batch][pos[2]][pos[1]][pos[0]]);
       atomicAdd(&grad_u[batch][dim][pos[2]][pos[1]][pos[0]],
@@ -1152,7 +1054,7 @@ static int tfluids_CudaMain_calcVelocityDivergenceBackward(lua_State *L) {
 
   return 0;
 }
-
+*/
 //******************************************************************************
 // solveLinearSystemPCG
 //******************************************************************************
@@ -1160,54 +1062,53 @@ static int tfluids_CudaMain_calcVelocityDivergenceBackward(lua_State *L) {
 // solveLinearSystemPCG lua entry point.
 static int tfluids_CudaMain_solveLinearSystemPCG(lua_State *L) {
   init_cusparse();  // No op if already initialized.
-/*
-  THCState* state = cutorch_getstate(L);
-  THCudaTensor* delta_u = reinterpret_cast<THCudaTensor*>(
-      luaT_checkudata(L, 1, "torch.CudaTensor"));
-  THCudaTensor* p = reinterpret_cast<THCudaTensor*>(
-      luaT_checkudata(L, 2, "torch.CudaTensor"));
-  THCudaTensor* geom = reinterpret_cast<THCudaTensor*>(
-      luaT_checkudata(L, 3, "torch.CudaTensor"));
-  THCudaTensor* u = reinterpret_cast<THCudaTensor*>(
-      luaT_checkudata(L, 4, "torch.CudaTensor"));
 
-  if (delta_u->nDimension != 5 || p->nDimension != 4 || geom->nDimension != 4 ||
-      u->nDimension != 5) {
-    luaL_error(L, "Incorrect dimensions. "
-                  "Expect delta_u: 5, p: 4, geom: 4, u: 5.");
-  }
-  const int nbatch = delta_u->size[0];
-  const int nuchan = delta_u->size[1];  // Can only be 2 or 3.
-  const int zdim = delta_u->size[2];
-  const int ydim = delta_u->size[3];
-  const int xdim = delta_u->size[4];
-  THCDeviceTensor<float, 5> dev_delta_u =
-      toDeviceTensor<float, 5>(state, delta_u);
-  THCDeviceTensor<float, 4> dev_p = toDeviceTensor<float, 4>(state, p);
-  THCDeviceTensor<float, 4> dev_geom = toDeviceTensor<float, 4>(state, geom);
-  THCDeviceTensor<float, 5> dev_u = toDeviceTensor<float, 5>(state, u);
-
-  if (nuchan != 2 && nuchan != 3) {
-    luaL_error(L, "Incorrect number of velocity channels.");
-  }
-
-  // Get raw ptrs.
-  const float* ptr_delta_u = dev_delta_u.data();
-  const float* ptr_p = dev_p.data();
-  const float* ptr_geom = dev_geom.data();
-  const float* ptr_u = dev_u.data();
-
-  // MAKE SURE THE cuSPARSE LIBRARY IS BOUND CORRECTLY. DONOTSUBMIT.
-  cusparseMatDescr_t descr = 0;  // DONOTSUBMIT
-  cusparseCreateMatDescr(&descr);  // DONOTSUBMIT
-  cusparseSetMatType(descr, CUSPARSE_MATRIX_TYPE_GENERAL);  // DONOTSUBMIT
-  cusparseSetMatIndexBase(descr, CUSPARSE_INDEX_BASE_ONE);  // DONOTSUBMIT
-*/
+//  THCState* state = cutorch_getstate(L);
+//  THCudaTensor* delta_u = reinterpret_cast<THCudaTensor*>(
+//      luaT_checkudata(L, 1, "torch.CudaTensor"));
+//  THCudaTensor* p = reinterpret_cast<THCudaTensor*>(
+//      luaT_checkudata(L, 2, "torch.CudaTensor"));
+//  THCudaTensor* geom = reinterpret_cast<THCudaTensor*>(
+//      luaT_checkudata(L, 3, "torch.CudaTensor"));
+//  THCudaTensor* u = reinterpret_cast<THCudaTensor*>(
+//      luaT_checkudata(L, 4, "torch.CudaTensor"));
+//
+//  if (delta_u->nDimension != 5 || p->nDimension != 4 || geom->nDimension != 4 ||
+//      u->nDimension != 5) {
+//    luaL_error(L, "Incorrect dimensions. "
+//                  "Expect delta_u: 5, p: 4, geom: 4, u: 5.");
+//  }
+//  const int nbatch = delta_u->size[0];
+//  const int nuchan = delta_u->size[1];  // Can only be 2 or 3.
+//  const int zdim = delta_u->size[2];
+//  const int ydim = delta_u->size[3];
+//  const int xdim = delta_u->size[4];
+//  THCDeviceTensor<float, 5> dev_delta_u =
+//      toDeviceTensor<float, 5>(state, delta_u);
+//  THCDeviceTensor<float, 4> dev_p = toDeviceTensor<float, 4>(state, p);
+//  THCDeviceTensor<float, 4> dev_geom = toDeviceTensor<float, 4>(state, geom);
+//  THCDeviceTensor<float, 5> dev_u = toDeviceTensor<float, 5>(state, u);
+//
+//  if (nuchan != 2 && nuchan != 3) {
+//    luaL_error(L, "Incorrect number of velocity channels.");
+//  }
+//
+//  // Get raw ptrs.
+//  const float* ptr_delta_u = dev_delta_u.data();
+//  const float* ptr_p = dev_p.data();
+//  const float* ptr_geom = dev_geom.data();
+//  const float* ptr_u = dev_u.data();
+//
+//  // MAKE SURE THE cuSPARSE LIBRARY IS BOUND CORRECTLY. DONOTSUBMIT.
+//  cusparseMatDescr_t descr = 0;  // DONOTSUBMIT
+//  cusparseCreateMatDescr(&descr);  // DONOTSUBMIT
+//  cusparseSetMatType(descr, CUSPARSE_MATRIX_TYPE_GENERAL);  // DONOTSUBMIT
+//  cusparseSetMatIndexBase(descr, CUSPARSE_INDEX_BASE_ONE);  // DONOTSUBMIT
   luaL_error(L, "ERROR: solveLinearSystemPCG not implemented");  // DONOTSUBMIT
  
   return 0;
 }
-
+/*
 //******************************************************************************
 // HELPER METHODS FOR ADVECTION ROUTINES
 //******************************************************************************
@@ -1715,7 +1616,7 @@ __device__ __forceinline__ float GetInterpValueCUDA(
   // interpolation:
   // 1. The particle trace is gaurenteed to return a position that is NOT within
   // geometry (but can be epsilon away from a geometry wall).
-  // 2. We have called setObstacleBcs prior to running advection which
+  // 2. We have called setGeomVelForAdvection prior to running advection which
   // allows us to interpolate one level into geometry without violating
   // constraints (it does so by setting geometry velocities such that the face
   // velocity is zero).
@@ -2167,23 +2068,190 @@ static int tfluids_CudaMain_advectVel(lua_State *L) {
 
   return 0;  
 }
+*/
+__global__ void kernel_volumetricUpSamplingNearestForward(
+    const int ratio, THCDeviceTensor<float, 5> in,
+    THCDeviceTensor<float, 5> out) {
+  const int pnt_id = threadIdx.x + blockIdx.x * blockDim.x;
+  const int dim = blockIdx.y;
+  const int batch = blockIdx.z;
+  if (pnt_id >= (out.getSize(2) * out.getSize(3) * out.getSize(4))) {
+    return;
+  }
+  const int x = pnt_id % out.getSize(4);
+  const int y = (pnt_id / out.getSize(4)) % out.getSize(3);
+  const int z = pnt_id / (out.getSize(3) * out.getSize(4));
+
+  const int xin = x / ratio;
+  const int yin = y / ratio;
+  const int zin = z / ratio;
+  const float inVal = in[batch][dim][zin][yin][xin];
+  out[batch][dim][z][y][x] = inVal;
+}
+
+static int tfluids_CudaMain_volumetricUpSamplingNearestForward(lua_State *L) {
+  THCState* state = cutorch_getstate(L);
+
+  const int32_t ratio = static_cast<int32_t>(lua_tointeger(L, 1));
+  THCudaTensor* input = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 2, "torch.CudaTensor"));
+  THCudaTensor* output = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 3, "torch.CudaTensor"));
+
+  if (input->nDimension != 5 || output->nDimension != 5) {
+    luaL_error(L, "ERROR: input and output must be dim 5");
+  }
+
+  const int32_t nbatch = input->size[0];
+  const int32_t nfeat = input->size[1];
+  const int32_t zdim = input->size[2];
+  const int32_t ydim = input->size[3];
+  const int32_t xdim = input->size[4];
+
+  if (output->size[0] != nbatch || output->size[1] != nfeat ||
+      output->size[2] != zdim * ratio || output->size[3] != ydim * ratio ||
+      output->size[4] != xdim * ratio) {
+    luaL_error(L, "ERROR: input : output size mismatch.");
+  }
+
+  THCDeviceTensor<float, 5> dev_in = toDeviceTensor<float, 5>(state, input);
+  THCDeviceTensor<float, 5> dev_out = toDeviceTensor<float, 5>(state, output);
+
+  if (!THCudaTensor_isContiguous(state, input)) {
+    luaL_error(L, "ERROR: input must be contiguous");
+  }
+  if (!THCudaTensor_isContiguous(state, output)) {
+    luaL_error(L, "ERROR: output must be contiguous");
+  }
+
+  // One thread per output element.
+  int nplane = dev_out.getSize(2) * dev_out.getSize(3) * dev_out.getSize(4);
+  dim3 grid_size(THCCeilDiv(nplane, 256), dev_out.getSize(1),
+                 dev_out.getSize(0));
+  dim3 block_size(nplane > 256 ? 256 : nplane);
+
+  kernel_volumetricUpSamplingNearestForward<<<grid_size, block_size, 0,
+                                            THCState_getCurrentStream(state)>>>(
+      ratio, dev_in, dev_out);
+
+  return 0;
+}
+
+__global__ void kernel_volumetricUpSamplingNearestBackward(
+    const int ratio, THCDeviceTensor<float, 5> grad_out,
+    THCDeviceTensor<float, 5> grad_in) {
+  const int pnt_id = threadIdx.x + blockIdx.x * blockDim.x;
+  const int dim = blockIdx.y;
+  const int batch = blockIdx.z; 
+  if (pnt_id >= (grad_in.getSize(2) * grad_in.getSize(3) *
+      grad_in.getSize(4))) {
+    return;
+  }
+  const int x = pnt_id % grad_in.getSize(4);
+  const int y = (pnt_id / grad_in.getSize(4)) % grad_in.getSize(3);
+  const int z = pnt_id / (grad_in.getSize(3) * grad_in.getSize(4));
+ 
+  float sum = 0.0f;
+
+  // Now accumulate gradients from the upsampling window.
+  for (int32_t zup = 0; zup < ratio; zup++) { 
+    for (int32_t yup = 0; yup < ratio; yup++) { 
+      for (int32_t xup = 0; xup < ratio; xup++) {
+        const int xin = x * ratio + xup;
+        const int yin = y * ratio + yup;
+        const int zin = z * ratio + zup;
+        const float val = grad_out[batch][dim][zin][yin][xin];
+        sum += val;
+      }
+    }
+  }
+        
+  grad_in[batch][dim][z][y][x] = sum;
+}
+
+static int tfluids_CudaMain_volumetricUpSamplingNearestBackward(lua_State *L) {
+  THCState* state = cutorch_getstate(L);
+  
+  const int32_t ratio = static_cast<int32_t>(lua_tointeger(L, 1));
+  THCudaTensor* input = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 2, "torch.CudaTensor"));
+  THCudaTensor* grad_output = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 3, "torch.CudaTensor"));
+  THCudaTensor* grad_input = reinterpret_cast<THCudaTensor*>(
+      luaT_checkudata(L, 4, "torch.CudaTensor"));
+  
+  if (input->nDimension != 5 || grad_output->nDimension != 5 ||
+      grad_input->nDimension != 5) {
+    luaL_error(L, "ERROR: input, gradOutput and gradInput must be dim 5");
+  }
+  
+  const int32_t nbatch = input->size[0];
+  const int32_t nfeat = input->size[1];
+  const int32_t zdim = input->size[2];
+  const int32_t ydim = input->size[3];
+  const int32_t xdim = input->size[4];
+
+  if (grad_output->size[0] != nbatch || grad_output->size[1] != nfeat ||
+      grad_output->size[2] != zdim * ratio ||
+      grad_output->size[3] != ydim * ratio ||
+      grad_output->size[4] != xdim * ratio) {
+    luaL_error(L, "ERROR: input : gradOutput size mismatch.");
+  }
+
+  if (grad_input->size[0] != nbatch || grad_input->size[1] != nfeat ||
+      grad_input->size[2] != zdim || grad_input->size[3] != ydim ||
+      grad_input->size[4] != xdim) {
+    luaL_error(L, "ERROR: input : gradInput size mismatch.");
+  }
+
+  THCDeviceTensor<float, 5> dev_in = toDeviceTensor<float, 5>(state, input);
+  THCDeviceTensor<float, 5> dev_grad_out = toDeviceTensor<float, 5>(
+      state, grad_output);
+  THCDeviceTensor<float, 5> dev_grad_in = toDeviceTensor<float, 5>(
+    state, grad_input);
+  
+  if (!THCudaTensor_isContiguous(state, input)) {
+    luaL_error(L, "ERROR: input must be contiguous");
+  }
+  if (!THCudaTensor_isContiguous(state, grad_output)) {
+    luaL_error(L, "ERROR: gradOutput must be contiguous");
+  }
+  if (!THCudaTensor_isContiguous(state, grad_input)) {
+    luaL_error(L, "ERROR: gradInput must be contiguous");
+  }
+
+  // One thread per grad_input element.
+  int nplane = dev_grad_in.getSize(2) * dev_grad_in.getSize(3) *
+    dev_grad_in.getSize(4);
+  dim3 grid_size(THCCeilDiv(nplane, 256), dev_grad_in.getSize(1),
+                 dev_grad_in.getSize(0));  
+  dim3 block_size(nplane > 256 ? 256 : nplane);
+  
+  kernel_volumetricUpSamplingNearestBackward<<<grid_size, block_size, 0,
+                                             THCState_getCurrentStream(state)>>>(
+      ratio, dev_grad_out, dev_grad_in);
+
+  return 0;
+}
 
 //******************************************************************************
 // INIT METHODS
 //******************************************************************************
-
 static const struct luaL_Reg tfluids_CudaMain__ [] = {
-  {"averageBorderCells", tfluids_CudaMain_averageBorderCells},
-  {"setObstacleBcs", tfluids_CudaMain_setObstacleBcs},
-  {"vorticityConfinement", tfluids_CudaMain_vorticityConfinement},
-  {"calcVelocityUpdate", tfluids_CudaMain_calcVelocityUpdate},
-  {"calcVelocityUpdateBackward", tfluids_CudaMain_calcVelocityUpdateBackward},
-  {"calcVelocityDivergence", tfluids_CudaMain_calcVelocityDivergence},
-  {"calcVelocityDivergenceBackward",
-   tfluids_CudaMain_calcVelocityDivergenceBackward},
+//  {"setGeomVelForAdvection", tfluids_CudaMain_setGeomVelForAdvection},
+//  {"vorticityConfinement", tfluids_CudaMain_vorticityConfinement},
+//  {"calcVelocityUpdate", tfluids_CudaMain_calcVelocityUpdate},
+//  {"calcVelocityUpdateBackward", tfluids_CudaMain_calcVelocityUpdateBackward},
+//  {"calcVelocityDivergence", tfluids_CudaMain_calcVelocityDivergence},
+//  {"calcVelocityDivergenceBackward",
+//   tfluids_CudaMain_calcVelocityDivergenceBackward},
   {"solveLinearSystemPCG", tfluids_CudaMain_solveLinearSystemPCG},
-  {"advectScalar", tfluids_CudaMain_advectScalar},
-  {"advectVel", tfluids_CudaMain_advectVel},
+//  {"advectScalar", tfluids_CudaMain_advectScalar},
+//  {"advectVel", tfluids_CudaMain_advectVel},
+  {"volumetricUpSamplingNearestForward",
+   tfluids_CudaMain_volumetricUpSamplingNearestForward},
+  {"volumetricUpSamplingNearestBackward",
+   tfluids_CudaMain_volumetricUpSamplingNearestBackward},
   {NULL, NULL}  // NOLINT
 };
 
