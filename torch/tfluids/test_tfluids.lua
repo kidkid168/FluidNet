@@ -77,7 +77,7 @@ function test.advectScalar()
     assert(is3D == (dim == 3))
 
     -- Now do advection using the 2 parameters and check against Manta.
-    for order = 1, 1 do  -- TEMP CODE.
+    for order = 1, 2 do
       for _, openBounds in pairs({false, true}) do
         -- Load the Manta ground truth.
         local openStr

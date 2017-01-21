@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// This is just a hacky way to expose our tfluids_(vec3) to the standalone
-// matlab MEX wrapper.
-
 #include <cmath>
 #include <limits>
 
@@ -68,6 +65,14 @@ struct tfluids_(vec3) {
     ret.z += rhs;
     return ret;
   }
+
+  const tfluids_(vec3) operator-(const real rhs) const {  // sub scalar
+    tfluids_(vec3) ret = *this;
+    ret.x -= rhs;
+    ret.y -= rhs;
+    ret.z -= rhs;
+    return ret;
+  }  
   
   const tfluids_(vec3) operator*(const real rhs) const {  // mult scalar
     tfluids_(vec3) ret = *this;
@@ -122,4 +127,10 @@ static inline void tfluids_(sub)(const tfluids_(vec3)& a,
 static inline real tfluids_(dot)(const tfluids_(vec3)& a,
                                  const tfluids_(vec3)& b) {
   return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static Int3 toInt3(const tfluids_(vec3)& val) {
+  return Int3(static_cast<int32_t>(val.x),
+              static_cast<int32_t>(val.y),
+              static_cast<int32_t>(val.z));
 }

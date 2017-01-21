@@ -54,17 +54,111 @@ inline real SemiLagrange(tfluids_(FlagGrid)& flags, tfluids_(MACGrid)& vel,
   return src.getInterpolatedHi(pos, order_space);
 }
 
-inline real MacCormackCorrect(tfluids_(FlagGrid)& flags, const real old,
-                              const real fwd, const real bwd,
+inline real MacCormackCorrect(tfluids_(FlagGrid)& flags,
+                              const tfluids_(RealGrid)& old,
+                              const tfluids_(RealGrid)& fwd,
+                              const tfluids_(RealGrid)& bwd,
                               const real strength, bool is_levelset,
                               int32_t i, int32_t j, int32_t k) {
-  real dst = fwd;
+  real dst = fwd(i, j, k);
 
   if (flags.isFluid(i, j, k)) {
     // Only correct inside fluid region.
-    dst += strength * 0.5 * (old - bwd);
+    dst += strength * 0.5 * (old(i, j, k) - bwd(i, j, k));
   }
   return dst;
+}
+
+inline void getMinMax(real& minv, real& maxv, const real& val) {
+  if (val < minv) {
+    minv = val;
+  }
+  if (val > maxv) {
+    maxv = val;
+  }
+}
+
+inline real clamp(const real val, const real min, const real max) {
+  return std::min<real>(max, std::max<real>(min, val));
+}
+
+inline real doClampComponent(const Int3& gridSize, real dst,
+                             const tfluids_(RealGrid)& orig, real fwd,
+                             const tfluids_(vec3)& pos,
+                             const tfluids_(vec3)& vel) {   
+  real minv = std::numeric_limits<real>::max();
+  real maxv = -std::numeric_limits<real>::max();
+
+  // forward (and optionally) backward
+  Int3 positions[2];
+  positions[0] = toInt3(pos - vel);
+  positions[1] = toInt3(pos + vel);
+
+  for (int32_t l=0; l<2; ++l) {
+    Int3& curr_pos = positions[l];
+
+    // clamp forward lookup to grid 
+    const int32_t i0 = clamp(curr_pos.x, 0, gridSize.x - 1);
+    const int32_t j0 = clamp(curr_pos.y, 0, gridSize.y - 1); 
+    const int32_t k0 = clamp(curr_pos.z, 0, 
+                             (orig.is_3d() ? (gridSize.z - 1) : 1));
+    const int32_t i1 = i0 + 1;
+    const int32_t j1 = j0 + 1;
+    const int32_t k1 = (orig.is_3d() ? (k0 + 1) : k0);
+    if (!orig.isInBounds(Int3(i0, j0, k0), 0) ||
+        !orig.isInBounds(Int3(i1, j1, k1), 0)) {
+      return fwd;
+    }
+
+    // find min/max around source pos
+    getMinMax(minv, maxv, orig(i0, j0, k0));
+    getMinMax(minv, maxv, orig(i1, j0, k0));
+    getMinMax(minv, maxv, orig(i0, j1, k0));
+    getMinMax(minv, maxv, orig(i1, j1, k0));
+
+    if (orig.is_3d()) {
+      getMinMax(minv, maxv, orig(i0, j0, k1));
+      getMinMax(minv, maxv, orig(i1, j0, k1));
+      getMinMax(minv, maxv, orig(i0, j1, k1)); 
+      getMinMax(minv, maxv, orig(i1, j1, k1));
+    }
+  }
+
+  dst = clamp(dst, minv, maxv);
+  return dst;
+}
+
+inline real MacCormackClamp(tfluids_(FlagGrid)& flags, tfluids_(MACGrid)& vel,
+                            real dval, const tfluids_(RealGrid)& orig,
+                            const tfluids_(RealGrid)& fwd, real dt,
+                            int32_t i, int32_t j, int32_t k) {
+  Int3 gridUpper = flags.getSize() - 1;
+
+  dval = doClampComponent(gridUpper, dval, orig, fwd(i,j,k),
+                          tfluids_(vec3)(i, j, k),
+                          vel.getCentered(i,j,k) * dt);
+
+  // Lookup forward/backward, round to closest NB.
+  Int3 pos_fwd = toInt3(tfluids_(vec3)(i, j, k) +
+                        tfluids_(vec3)(0.5, 0.5, 0.5) -
+                        vel.getCentered(i, j, k) * dt);
+  Int3 pos_bwd = toInt3(tfluids_(vec3)(i, j, k) +
+                        tfluids_(vec3)(0.5, 0.5, 0.5) +
+                        vel.getCentered(i, j, k) * dt);
+
+  // Test if lookups point out of grid or into obstacle (note doClampComponent
+  // already checks sides, below is needed for valid flags access).
+  if (pos_fwd.x < 0 || pos_fwd.y < 0 || pos_fwd.z < 0 ||
+      pos_bwd.x < 0 || pos_bwd.y < 0 || pos_bwd.z < 0 ||
+      pos_fwd.x > gridUpper.x || pos_fwd.y > gridUpper.y ||
+      ((pos_fwd.z > gridUpper.z) && flags.is_3d()) ||
+      pos_bwd.x > gridUpper.x || pos_bwd.y > gridUpper.y ||
+      ((pos_bwd.z > gridUpper.z) && flags.is_3d()) ||
+      flags.isObstacle(pos_fwd) || flags.isObstacle(pos_bwd) ) {
+    dval = fwd(i,j,k);
+  }
+
+  return dval;
 }
 
 static int tfluids_(Main_advectScalar)(lua_State *L) {
@@ -78,14 +172,16 @@ static int tfluids_(Main_advectScalar)(lua_State *L) {
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 3, torch_Tensor));
   THTensor* tensor_flags =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 4, torch_Tensor));
-  THTensor* tensor_s_tmp =
+  THTensor* tensor_fwd =
       reinterpret_cast<THTensor*>(luaT_checkudata(L, 5, torch_Tensor));
-  const bool is_3d = static_cast<bool>(lua_toboolean(L, 6));
-  const std::string method = static_cast<std::string>(lua_tostring(L, 7));
-  const bool open_bounds = static_cast<bool>(lua_toboolean(L, 8));
-  const int32_t boundary_width = static_cast<int32_t>(lua_tointeger(L, 9));
+  THTensor* tensor_bwd =
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 6, torch_Tensor));
+  const bool is_3d = static_cast<bool>(lua_toboolean(L, 7));
+  const std::string method = static_cast<std::string>(lua_tostring(L, 8));
+  const bool open_bounds = static_cast<bool>(lua_toboolean(L, 9));
+  const int32_t boundary_width = static_cast<int32_t>(lua_tointeger(L, 10));
   THTensor* tensor_s_dst =
-      reinterpret_cast<THTensor*>(luaT_checkudata(L, 10, torch_Tensor));
+      reinterpret_cast<THTensor*>(luaT_checkudata(L, 11, torch_Tensor));
 
   // Note: all the checks for sizes and dim are done in init.lua, we're going
   // to do a few here just because we're paranoid.
@@ -101,7 +197,6 @@ static int tfluids_(Main_advectScalar)(lua_State *L) {
   const int32_t xdim = static_cast<int32_t>(tensor_u->size[3]);
   const int32_t ydim = static_cast<int32_t>(tensor_u->size[2]);
   const int32_t zdim = static_cast<int32_t>(tensor_u->size[1]);
-
   if (!is_3d && zdim != 1) {
     luaL_error(L, "2D u does not have unit z dimension!");
   }
@@ -111,7 +206,11 @@ static int tfluids_(Main_advectScalar)(lua_State *L) {
   tfluids_(MACGrid) vel(tensor_u, is_3d);
   tfluids_(RealGrid) src(tensor_s, is_3d);
   tfluids_(RealGrid) dst(tensor_s_dst, is_3d);
-  tfluids_(RealGrid) fwd(tensor_s_tmp, is_3d);
+
+  // The maccormack method also needs fwd and bwd temporary arrays.
+  // TODO(tompson): it definitely needs fwd, but does it need bwd?
+  tfluids_(RealGrid) fwd(tensor_fwd, is_3d);
+  tfluids_(RealGrid) bwd(tensor_bwd, is_3d);
   
   if (method != "maccormack" && method != "euler") {
     luaL_error(L, "advectScalar method is not supported.");
@@ -130,7 +229,12 @@ static int tfluids_(Main_advectScalar)(lua_State *L) {
         if (i < bnd || i > xdim - 1 - bnd ||
             j < bnd || j > ydim - 1 - bnd ||
             (is_3d && (k < bnd || k > zdim - 1 - bnd))) {
-          dst(i, j, k) = 0;  // Manta zeros stuff on the border.
+          // Manta zeros stuff on the border.
+          if (order == 1) {
+            dst(i, j, k) = static_cast<real>(0);
+          } else {
+            fwd(i, j, k) = static_cast<real>(0);
+          }
           continue;
         }
 
@@ -155,7 +259,6 @@ static int tfluids_(Main_advectScalar)(lua_State *L) {
   // Otherwise we need to do the backwards step (which is a SemiLagrange step
   // on the forward data - hence we needed to finish the above loops before
   // moving on).
-  const real strength = static_cast<real>(1);
 #pragma omp parallel for collapse(3) private(k, j, i)
   for(k = 0; k < zdim; k++) { 
     for(j = 0; j < ydim; j++) { 
@@ -163,27 +266,41 @@ static int tfluids_(Main_advectScalar)(lua_State *L) {
         if (i < bnd || i > xdim - 1 - bnd ||
             j < bnd || j > ydim - 1 - bnd ||
             (is_3d && (k < bnd || k > zdim - 1 - bnd))) {
+          bwd(i, j, k) = static_cast<real>(0);
           continue; 
         } 
 
-        const real orig = src(i, j, k);
-        const real fwd_val = fwd(i, j, k);
-
         // Backwards step.
-        const real bwd = SemiLagrange(flags, vel, fwd, -dt, is_levelset,
-                                      order_space, i, j, k);
-        
-        // compute correction.
-        // TODO(tompson): This kernel is on the entire domain in Manta but not
-        // here.
-        const real val = MacCormackCorrect(flags, orig, fwd_val, bwd, strength,
-                                           is_levelset, i, j, k); 
+        bwd(i, j, k) = SemiLagrange(flags, vel, fwd, -dt, is_levelset,
+                                    order_space, i, j, k);
+      }
+    }
+  }
 
-        // clamp vals.
-        // TODO(tompson): This kernel is on the entire domain in Manta but not
-        // here.
-//        MacCormackClamp(flags, vel, newGrid, orig, fwd, dt);
-        dst(i, j, k) = val;
+  // Now compute the correction.
+  const real strength = static_cast<real>(1);
+#pragma omp parallel for collapse(3) private(k, j, i)
+  for(k = 0; k < zdim; k++) { 
+    for(j = 0; j < ydim; j++) { 
+      for(i = 0; i < xdim; i++) { 
+        dst(i, j, k) = MacCormackCorrect(flags, src, fwd, bwd, strength,
+                                         is_levelset, i, j, k);
+      }
+    }
+  }
+
+  // Now perform clamping.
+#pragma omp parallel for collapse(3) private(k, j, i)
+  for(k = 0; k < zdim; k++) { 
+    for(j = 0; j < ydim; j++) { 
+      for(i = 0; i < xdim; i++) {
+        if (i < bnd || i > xdim - 1 - bnd ||
+            j < bnd || j > ydim - 1 - bnd ||
+            (is_3d && (k < bnd || k > zdim - 1 - bnd))) {
+          continue;
+        }
+        const real dval = dst(i, j, k);
+        dst(i, j, k) = MacCormackClamp(flags, vel, dval, src, fwd, dt, i, j, k);
       }
     }
   }

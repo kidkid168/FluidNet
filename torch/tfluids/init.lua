@@ -59,11 +59,13 @@ local function advectScalar(dt, s, U, flags, sDst, method, openBounds,
 
   -- If we're using maccormack advection we need a temporary array, however
   -- we should just allocate always since it makes the C++ logic easier.
-  tfluids._tmp[torch.type(s)] = tfluids._tmp[torch.type(s)] or s:clone()
-  tfluids._tmp[torch.type(s)]:resizeAs(s)
+  tfluids._tmp[torch.type(s)] = tfluids._tmp[torch.type(s)] or s:new()
   local sTmp = tfluids._tmp[torch.type(s)]
+  sTmp:resize(2, d, h, w)
+  local fwd = sTmp:narrow(1, 1, 1)  -- recall: (dim, index, size)
+  local bwd = sTmp:narrow(1, 2, 1)
 
-  s.tfluids.advectScalar(dt, s, U, flags, sTmp, is3D, method, openBounds,
+  s.tfluids.advectScalar(dt, s, U, flags, fwd, bwd, is3D, method, openBounds,
                          boundaryWidth, sDst)
 end
 rawset(tfluids, 'advectScalar', advectScalar)

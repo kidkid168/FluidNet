@@ -45,7 +45,24 @@ public:
   inline int32_t xstride() const { return tensor_->stride[3]; }
 
   inline bool is_3d() const { return is_3d_; }
-  
+
+  inline Int3 getSize() const { return Int3(xsize(), ysize(), zsize()); }
+
+  inline bool isInBounds(const Int3& p, int bnd) const {
+    bool ret = (p.x >= bnd && p.y >= bnd && p.x < xsize() - bnd &&
+                p.y < ysize() - bnd);
+    if (is_3d_) {
+      ret &= (p.z >= bnd && p.z < zsize() - bnd);
+    } else {
+      ret &= (p.z == 0);
+    }
+    return ret; 
+  }
+
+  inline bool isInBounds(const tfluids_(vec3)& p, int bnd) const {
+    return isInBounds(toInt3(p), bnd);
+  }
+
 private:
   // Note: Child classes should use getters!
   THTensor* const tensor_;
@@ -133,6 +150,14 @@ public:
 
   inline bool isFluid(int32_t i, int32_t j, int32_t k) const {
     return static_cast<int>(data(i, j, k)) & TypeFluid;
+  }
+
+  inline bool isObstacle(int32_t i, int32_t j, int32_t k) const {
+    return static_cast<int>(data(i, j, k)) & TypeObstacle;
+  }
+
+  inline bool isObstacle(const Int3& pos) const {
+    return isObstacle(pos.x, pos.y, pos.z);
   }
 
 private:

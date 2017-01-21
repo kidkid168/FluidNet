@@ -23,24 +23,9 @@
 
 // This type is common to both float and double implementations and so has
 // to be defined outside tfluids.cc.
-typedef struct Int3 {
-  int32_t x;
-  int32_t y;
-  int32_t z;
-} Int3;
+#include "generic/int3.cc"
 
-inline int32_t IX(const int32_t i, const int32_t j, const int32_t k,
-                  const Int3& dims) {
-#if defined(DEBUG)
-  assert(i >= 0 && i < dims.x);
-  assert(j >= 0 && j < dims.y);
-  assert(k >= 0 && k < dims.z);
-#endif
-  return i + j * dims.x + k * dims.x * dims.y;
-}
-
-inline int32_t ClampInt32(const int32_t x, const int32_t low,
-                          const int32_t high) {
+inline int32_t clamp(const int32_t x, const int32_t low, const int32_t high) {
   return std::max<int32_t>(std::min<int32_t>(x, high), low);
 }
 
